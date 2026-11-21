@@ -17,6 +17,36 @@ export default {
   ...landing,
   ...common,
   ...dashboard,
+  modelPlaza: {
+    ...dashboard.modelPlaza,
+    description: 'Browse models and pricing by type and group.',
+    empty: 'No models are available yet.',
+    noSearchResult: 'No models match your filters.',
+    emptyGroups: 'Groups without models',
+    clearFilters: 'Clear filters',
+    retry: 'Try again',
+    types: {
+      all: 'All',
+      text: 'Text',
+      image: 'Image',
+      video: 'Video',
+      audio: 'Audio',
+      embedding: 'Embedding',
+      other: 'Other'
+    },
+    filters: {
+      ...dashboard.modelPlaza.filters,
+      typeLabel: 'Model type',
+      allGroups: 'All groups'
+    },
+    table: {
+      ...dashboard.modelPlaza.table,
+      peakPriceHint: 'The per-model peak price shown includes the effective group or personal rate.',
+      referenceMetric: '{priceSource}: {metric}',
+      tokenPriceLabel: '{metric} ({unit})',
+      pricePair: 'Input / output'
+    }
+  },
   ...channelMonitorV2,
   ...batchImage,
   ...tickets,

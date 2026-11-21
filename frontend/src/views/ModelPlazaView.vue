@@ -1,20 +1,18 @@
 <template>
-  <!-- 后台内嵌形态:?embedded=1 且已登录,套完整后台布局 -->
   <AppLayout v-if="isEmbedded">
-    <ModelPlazaContent :response="data" :loading="loading" :error="loadFailed" embedded />
+    <ModelPlazaContent v-bind="contentProps" embedded @retry="loadCatalog" />
   </AppLayout>
 
-  <!-- 独立形态:自带导航条(logo/站名 + 登录/回后台) -->
-  <div v-else class="min-h-screen bg-gray-50 dark:bg-dark-950">
-    <PlazaNavBar />
-    <main class="mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:px-8 lg:py-8">
-      <ModelPlazaContent :response="data" :loading="loading" :error="loadFailed" />
+  <div v-else class="min-h-screen bg-[var(--ui-canvas)]">
+    <PlazaNavBar :authenticated="authenticated" />
+    <main class="mx-auto min-w-0 max-w-7xl px-4 py-5 sm:px-6 lg:px-8">
+      <ModelPlazaContent v-bind="contentProps" @retry="loadCatalog" />
     </main>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onScopeDispose, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import AppLayout from '@/components/layout/AppLayout.vue'
 import PlazaNavBar from '@/components/modelPlaza/PlazaNavBar.vue'
@@ -27,22 +25,63 @@ const route = useRoute()
 const appStore = useAppStore()
 const authStore = useAuthStore()
 
-// embedded=1 但未登录(如转发的链接)自动降级为独立形态。
-const isEmbedded = computed(() => route.query.embedded === '1' && authStore.isAuthenticated)
+// Browser storage may be cleared by logout in a different tab before Pinia changes here.
+const storageLoggedOut = ref(false)
+const authenticated = computed(() => authStore.isAuthenticated && !storageLoggedOut.value)
+const isEmbedded = computed(() => route.query.embedded === '1' && authenticated.value)
 
 const data = ref<ModelPlazaResponse | null>(null)
 const loading = ref(true)
 const loadFailed = ref(false)
+const contentProps = computed(() => ({
+  response: data.value,
+  loading: loading.value,
+  error: loadFailed.value,
+  authenticated: authenticated.value
+}))
 
-onMounted(async () => {
-  // 独立形态导航条需要站点名/Logo;有 __APP_CONFIG__ 注入时同步命中缓存。
-  void appStore.fetchPublicSettings()
+let request: AbortController | undefined
+
+async function loadCatalog() {
+  request?.abort()
+  const controller = new AbortController()
+  request = controller
+  data.value = null
+  loading.value = true
+  loadFailed.value = false
+
+  // Pinia changes before the auth store finishes persisting/clearing the token used by Axios.
+  await Promise.resolve()
+  if (controller.signal.aborted) return
+
   try {
-    data.value = await getModelPlaza()
+    const response = await getModelPlaza({ signal: controller.signal })
+    if (!controller.signal.aborted) data.value = response
   } catch {
-    loadFailed.value = true
+    if (!controller.signal.aborted) loadFailed.value = true
   } finally {
-    loading.value = false
+    if (!controller.signal.aborted) loading.value = false
   }
+}
+
+watch([() => authStore.token, () => authStore.user?.id], () => {
+  storageLoggedOut.value = false
+  void loadCatalog()
+}, { immediate: true, flush: 'sync' })
+
+function onSessionStorageChange(event: StorageEvent) {
+  if (event.storageArea !== window.localStorage || (event.key !== null && event.key !== 'auth_token')) return
+  storageLoggedOut.value = !window.localStorage.getItem('auth_token')
+  void loadCatalog()
+}
+
+onMounted(() => {
+  void appStore.fetchPublicSettings()
+  window.addEventListener('storage', onSessionStorageChange)
+})
+
+onScopeDispose(() => {
+  request?.abort()
+  window.removeEventListener('storage', onSessionStorageChange)
 })
 </script>

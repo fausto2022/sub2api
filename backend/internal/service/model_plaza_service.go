@@ -23,8 +23,9 @@ type PlazaOfficialPricing struct {
 
 // PlazaModel 模型广场中单个模型条目：按实收口径合成的展示定价 + 官方参考价。
 type PlazaModel struct {
-	Name     string
-	Platform string
+	Name      string
+	Platform  string
+	ModelType PlazaModelType
 	// CatalogPricing 管理员在「模型价格」页配置的目录价（USD per token，未乘倍率）。
 	// 仅当该模型被目录价层接管（override 条目带 `_catalog` 元数据且可计价）时给出；
 	// 为 nil 表示该模型未纳入目录价，前端回落到 Pricing 展示。
@@ -114,7 +115,7 @@ func NewModelPlazaService(
 //   - token 模型的单价与阶梯按实收口径合成（见 ResolveContextPricingSchedule），
 //     图片计费模型的档位价按实收口径合成（见 plazaImageDisplayPricing）；
 //   - 每个模型附带官方参考价（查不到为 nil）；
-//   - 只返回 Models 非空的分组；分组按 RateMultiplier 升序（同倍率按名称），
+//   - 保留空分组；分组按 RateMultiplier 升序（同倍率按名称），
 //     组内模型按名称排序。
 //
 // 可见性过滤（专属分组）不在此层做，由 handler 按登录态裁剪。
@@ -213,12 +214,10 @@ func (s *ModelPlazaService) ListGroups(ctx context.Context) ([]PlazaGroup, error
 	}
 
 	officialMemo := make(map[string]*PlazaOfficialPricing)
+	modelTypeMemo := make(map[string]PlazaModelType)
 	out := make([]PlazaGroup, 0, len(order))
 	for _, gid := range order {
 		pg := byGroup[gid]
-		if len(pg.Models) == 0 {
-			continue
-		}
 		sort.SliceStable(pg.Models, func(i, j int) bool {
 			if pg.Models[i].Name != pg.Models[j].Name {
 				return pg.Models[i].Name < pg.Models[j].Name
@@ -227,7 +226,9 @@ func (s *ModelPlazaService) ListGroups(ctx context.Context) ([]PlazaGroup, error
 		})
 		g := groupEnt[gid]
 		for j := range pg.Models {
-			s.fillDisplayPricing(ctx, &pg.Models[j], g)
+			m := &pg.Models[j]
+			m.ModelType = s.plazaModelType(m, g, modelTypeMemo)
+			s.fillDisplayPricing(ctx, m, g)
 			pg.Models[j].OfficialPricing = s.lookupOfficialPricing(ctx, pg.Models[j].Name, officialMemo)
 			// 折后价 = 展示单价 × 分组默认生效倍率（design.md §4.3）。
 			// 用户专属倍率在 handler 层按登录态覆盖，见 PlazaDiscountedPricing。

@@ -14,9 +14,8 @@ import (
 //
 // 广场路由挂 OptionalJWT 中间件：匿名可访问（除非 require_auth 开启），带 token 则
 // 识别用户。可见性规则（橱窗语义，与「可用渠道」的可绑定语义不同）：
-//   - 匿名：仅非专属分组（订阅型照常展示）；
-//   - 登录：非专属分组 + user_allowed_groups 授权或持有有效订阅的专属分组；
-//     若该用户开启了公开分组限制，则公开分组同样需要落在授权集合内。
+//   - 所有人：全部非专属分组，包括订阅型及受账号绑定限制的公开分组；
+//   - 登录用户：另可见 user_allowed_groups 授权或持有有效订阅的专属分组。
 type ModelPlazaHandler struct {
 	plazaService   *service.ModelPlazaService
 	apiKeyService  *service.APIKeyService
@@ -75,6 +74,7 @@ type modelPlazaTimePricing struct {
 type modelPlazaModel struct {
 	Name              string                     `json:"name"`
 	Platform          string                     `json:"platform"`
+	ModelType         service.PlazaModelType     `json:"model_type"`
 	CatalogPricing    *userSupportedModelPricing `json:"catalog_pricing"`
 	Pricing           *userSupportedModelPricing `json:"pricing"`
 	DiscountedPricing *userSupportedModelPricing `json:"discounted_pricing"`
@@ -122,6 +122,8 @@ type modelPlazaResponse struct {
 // Get 返回模型广场数据。
 // GET /api/v1/model-plaza
 func (h *ModelPlazaHandler) Get(c *gin.Context) {
+	// The same URL can return private groups and personal rates to different callers.
+	c.Header("Cache-Control", "private, no-store")
 	if h.settingService == nil {
 		response.NotFound(c, "Model plaza is not enabled")
 		return
@@ -146,10 +148,9 @@ func (h *ModelPlazaHandler) Get(c *gin.Context) {
 
 	// allowedGroups == nil 表示匿名；登录用户恒为非 nil（可能为空集合）。
 	var allowedGroups map[int64]struct{}
-	var restrictPublicGroups bool
 	var userRates map[int64]float64
 	if authed {
-		allowedGroups, restrictPublicGroups, err = h.apiKeyService.GetUserGroupVisibility(c.Request.Context(), subject.UserID)
+		allowedGroups, _, err = h.apiKeyService.GetUserGroupVisibility(c.Request.Context(), subject.UserID)
 		if err != nil {
 			// 可见性数据拿不到时不能静默降级成匿名视图（会错漏专属分组），直接报错。
 			response.ErrorFrom(c, err)
@@ -163,7 +164,7 @@ func (h *ModelPlazaHandler) Get(c *gin.Context) {
 		}
 	}
 
-	visible := filterPlazaVisibleGroups(groups, allowedGroups, restrictPublicGroups)
+	visible := filterPlazaVisibleGroups(groups, allowedGroups)
 
 	// 广场可匿名访问，分组文案随请求语言变化，提示中间缓存按语言区分。
 	// 追加而非覆盖：CORS 中间件已为具体来源写入 Vary: Origin。
@@ -177,16 +178,14 @@ func (h *ModelPlazaHandler) Get(c *gin.Context) {
 
 // filterPlazaVisibleGroups 按登录态裁剪分组可见性。
 // allowedGroups == nil 表示匿名（仅非专属）；非 nil 包含普通授权及有效订阅分组。
-// restrictPublicGroups 为 true 时，公开分组也必须落在 allowedGroups 内，否则用户会
-// 在广场看到自己实际绑定不了的分组。
+// 账号绑定限制不改变公开分组的展示。
 func filterPlazaVisibleGroups(
 	groups []service.PlazaGroup,
 	allowedGroups map[int64]struct{},
-	restrictPublicGroups bool,
 ) []service.PlazaGroup {
 	visible := make([]service.PlazaGroup, 0, len(groups))
 	for _, g := range groups {
-		if g.IsExclusive || (restrictPublicGroups && allowedGroups != nil) {
+		if g.IsExclusive {
 			if allowedGroups == nil {
 				continue
 			}
@@ -229,6 +228,7 @@ func toModelPlazaGroupDTO(g *service.PlazaGroup, userRates map[int64]float64) mo
 		models = append(models, modelPlazaModel{
 			Name:              m.Name,
 			Platform:          m.Platform,
+			ModelType:         m.ModelType,
 			CatalogPricing:    toUserPricing(m.CatalogPricing),
 			Pricing:           toUserPricing(m.Pricing),
 			DiscountedPricing: toUserPricing(discounted),

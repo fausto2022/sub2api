@@ -56,6 +56,7 @@ const siteName = computed(() => settings.value?.site_name || 'Sub2API')
 const siteLogo = computed(() =>
   sanitizeUrl(settings.value?.site_logo || '', { allowRelative: true, allowDataUrl: true })
 )
-const isAuthenticated = computed(() => authStore.isAuthenticated)
+const props = defineProps<{ authenticated?: boolean }>()
+const isAuthenticated = computed(() => props.authenticated ?? authStore.isAuthenticated)
 const backTarget = computed(() => (authStore.isAdmin ? '/admin/dashboard' : '/dashboard'))
 </script>

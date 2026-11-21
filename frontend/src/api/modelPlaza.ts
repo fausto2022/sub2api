@@ -44,9 +44,14 @@ export interface PlazaTimePricing {
   periods: PlazaTimePricingPeriod[]
 }
 
+export const PLAZA_MODEL_TYPES = ['text', 'image', 'video', 'audio', 'embedding', 'other'] as const
+export type PlazaModelType = (typeof PLAZA_MODEL_TYPES)[number]
+
 export interface PlazaModel {
   name: string
   platform: string
+  /** Catalog type is independent of billing mode. Older servers may omit it. */
+  model_type?: PlazaModelType
   /**
    * 模型目录价（管理员在「模型价格」页配置，未乘倍率）；未纳入目录价时为 null。
    * 目录价层接管时 pricing 与它同源，但未接管时 pricing 是真渠道/分组价。

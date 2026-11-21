@@ -64,7 +64,13 @@ func ProvideSchedulerCache(rdb *redis.Client, cfg *config.Config) service.Schedu
 }
 
 // ProviderSet is the Wire provider set for all repositories
+func ProvideFailoverCooldownStore(rdb *redis.Client, cfg *config.Config) service.FailoverCooldownStore {
+	return NewFailoverCooldownCache(rdb, cfg.Gateway.FailoverPolicy.Cooldown, &service.FailoverCooldownDegradedCounter{})
+}
+
 var ProviderSet = wire.NewSet(
+	NewGroupFailoverPolicyRepository,
+	ProvideFailoverCooldownStore,
 	NewUserRepository,
 	NewMCPOAuthRepository,
 	NewAPIKeyRepository,
@@ -80,8 +86,11 @@ var ProviderSet = wire.NewSet(
 	NewPromoCodeRepository,
 	NewAnnouncementRepository,
 	NewAnnouncementReadRepository,
+	NewTicketRepository,
+	NewTicketAttachmentRepository,
 	NewUsageLogRepository,
 	NewUsageBillingRepository,
+	NewUpstreamCostAttemptRepository,
 	NewBatchImageRepository,
 	NewGeminiCachedContentRepository,
 	NewIdempotencyRepository,
@@ -90,6 +99,7 @@ var ProviderSet = wire.NewSet(
 	NewSettingRepository,
 	NewScopedAdminKeyRepository,
 	NewOpsRepository,
+	NewOpsMgmtRepository, // 运营管理（上游对接 / 利润保护 / 扩池），表前缀 ops_mgmt_
 	NewAuditLogRepository,
 	NewPasskeyRepository,
 	NewPasskeySessionStore,

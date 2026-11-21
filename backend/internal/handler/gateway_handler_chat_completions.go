@@ -21,6 +21,8 @@ import (
 // This converts Chat Completions requests to Anthropic format (via Responses format chain),
 // forwards to Anthropic upstream, and converts responses back to Chat Completions format.
 func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
+	installCostAttemptAudit(c, h.upstreamCostRecorder)
+	defer finishFailoverObservation(c)
 	streamStarted := false
 
 	requestStart := time.Now()
@@ -36,6 +38,7 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 		h.chatCompletionsErrorResponse(c, http.StatusInternalServerError, "api_error", "User context not found")
 		return
 	}
+	defer h.installFailoverRouting(c)()
 	reqLog := requestLogger(
 		c,
 		"handler.gateway.chat_completions",
@@ -60,6 +63,7 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 		return
 	}
 
+	captureFailoverIdempotencyInput(c, body)
 	setOpsRequestContext(c, "", false)
 
 	// Validate JSON
@@ -185,16 +189,16 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 		selectionSessionHash = "gemini:" + selectionSessionHash
 	}
 	// 3. Account selection + failover loop
-	fs := NewFailoverState(h.maxAccountSwitches, false)
+	fs := h.newGroupFailoverState(c, apiKey.GroupID, h.maxAccountSwitches, false)
 	if groupPlatform == service.PlatformGemini {
-		fs = NewFailoverState(h.maxAccountSwitchesGemini, false)
+		fs = h.newGroupFailoverState(c, apiKey.GroupID, h.maxAccountSwitchesGemini, false)
 	}
 
 	for {
 		if failoverClientGone(c) {
 			return
 		}
-		selection, err := h.gatewayService.SelectAccountWithLoadAwareness(c.Request.Context(), apiKey.GroupID, selectionSessionHash, reqModel, fs.FailedAccountIDs, "", int64(0))
+		selection, err := fs.selectGatewayAccount(c.Request.Context(), h.gatewayService, apiKey.GroupID, selectionSessionHash, reqModel, fs.selectionExclusions(), "", int64(0))
 		if err != nil {
 			if failoverClientGone(c) {
 				reqLog.Info("gateway.cc.account_select_aborted_client_disconnected", zap.Error(err))
@@ -228,6 +232,10 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 				}
 				return
 			}
+		}
+		if fs.rejectIdempotencyRetrySelection(c.Request.Context(), selection) {
+			h.handleCCFailoverExhausted(c, fs.LastFailoverErr, streamStarted)
+			return
 		}
 		account := selection.Account
 		setOpsSelectedAccount(c, account.ID, account.Platform)
@@ -271,6 +279,10 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 		}
 		account = latest
 		selection.Account = latest
+		if !fs.admitIsolation(admissionCtx, selection, accountReleaseFunc) {
+			h.gatewayService.ReleaseAccountSession(context.WithoutCancel(admissionCtx), account, selectionSessionHash)
+			continue
+		}
 		if selection.ProfitGateActive() {
 			if err := h.gatewayService.BindStickySessionAfterProfitAdmission(admissionCtx, apiKey.GroupID, selectionSessionHash, account.ID); err != nil {
 				reqLog.Warn("gateway.cc.bind_sticky_session_after_profit_admission_failed", zap.Int64("account_id", account.ID), zap.Error(err))
@@ -293,18 +305,22 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 			forwardBody = h.gatewayService.ReplaceModelInBody(body, channelMapping.MappedModel)
 		}
 		var result *service.ForwardResult
+		fs.observeForward(c, account, apiKey.GroupID, reqModel)
+		forwardCtx, finishBudget := fs.beginForward(c.Request.Context(), c, reqStream, 0)
 		setActualUpstreamEndpoint(c, "")
 		if account.Platform == service.PlatformGemini {
 			if h.geminiCompatService == nil {
+				_ = finishBudget()
 				h.chatCompletionsErrorResponse(c, http.StatusBadGateway, "upstream_error", "Gemini compatibility service is not configured")
 				if accountReleaseFunc != nil {
 					accountReleaseFunc()
 				}
 				return
 			}
-			result, err = h.geminiCompatService.ForwardAsChatCompletions(c.Request.Context(), c, account, forwardBody)
+			result, err = h.geminiCompatService.ForwardAsChatCompletions(forwardCtx, c, account, forwardBody)
 		} else if shouldUseAntigravityCompat(account) {
 			if h.antigravityGatewayService == nil {
+				_ = finishBudget()
 				h.chatCompletionsErrorResponse(c, http.StatusBadGateway, "upstream_error", "Antigravity compatibility service is not configured")
 				if accountReleaseFunc != nil {
 					accountReleaseFunc()
@@ -312,13 +328,19 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 				return
 			}
 			setActualUpstreamEndpoint(c, EndpointAntigravityGenerateContent)
-			result, err = h.antigravityGatewayService.ForwardAsChatCompletions(c.Request.Context(), c, account, forwardBody, parsedReq)
+			result, err = h.antigravityGatewayService.ForwardAsChatCompletions(forwardCtx, c, account, forwardBody, parsedReq)
 		} else {
-			result, err = h.gatewayService.ForwardAsChatCompletions(c.Request.Context(), c, account, forwardBody, parsedReq)
+			result, err = h.gatewayService.ForwardAsChatCompletions(forwardCtx, c, account, forwardBody, parsedReq)
 		}
 
+		err = fs.applyForwardBudgetError(err, finishBudget())
+		gatewayIsolationFrom(c.Request.Context()).recordForward(c.Request.Context(), result, err, c.Writer.Size() == writerSizeBeforeForward)
 		if accountReleaseFunc != nil {
 			accountReleaseFunc()
+		}
+
+		if h.upstreamCostRecorder != nil {
+			recordGatewayForwardCost(c, result, err)
 		}
 
 		// 提交 usage 记录。成功路径与"流中断但 Forward 已观测到 usage 的部分结果"
@@ -404,16 +426,21 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 
 // chatCompletionsErrorResponse writes an error in OpenAI Chat Completions format.
 func (h *GatewayHandler) chatCompletionsErrorResponse(c *gin.Context, status int, errType, message string) {
-	c.JSON(status, gin.H{
-		"error": gin.H{
-			"type":    errType,
-			"message": message,
-		},
-	})
+	object := gin.H{
+		"type":    errType,
+		"message": message,
+	}
+	addFailoverTerminalFields(c, object)
+	c.JSON(status, gin.H{"error": object})
 }
 
 // handleCCFailoverExhausted writes a failover-exhausted error in CC format.
 func (h *GatewayHandler) handleCCFailoverExhausted(c *gin.Context, lastErr *service.UpstreamFailoverError, streamStarted bool) {
+	lastStatus := 0
+	if lastErr != nil {
+		lastStatus = lastErr.StatusCode
+	}
+	prepareFailoverTerminal(c, lastStatus, "accounts", h.cfg)
 	if streamStarted {
 		return
 	}
@@ -441,6 +468,9 @@ func (h *GatewayHandler) handleCCFailoverExhausted(c *gin.Context, lastErr *serv
 		service.SetOpsUpstreamError(c, statusCode, service.OpenAISilentRefusalClientMessage(), "")
 		h.chatCompletionsErrorResponse(c, http.StatusBadGateway, "upstream_error", service.OpenAISilentRefusalClientMessage())
 		return
+	}
+	if mixedFailoverStatus(c, h.cfg) {
+		statusCode = http.StatusServiceUnavailable
 	}
 	h.chatCompletionsErrorResponse(c, statusCode, "server_error", "All available accounts exhausted")
 }

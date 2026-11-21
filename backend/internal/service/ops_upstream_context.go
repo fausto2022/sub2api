@@ -1,17 +1,41 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/model"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+type gatewayExecutionIDKey struct{}
+
+// GatewayExecutionIDFromContext returns the server-owned ID for this execution.
+// It is unrelated to client-provided correlation and billing identifiers.
+func GatewayExecutionIDFromContext(ctx context.Context) uuid.UUID {
+	if ctx == nil {
+		return uuid.Nil
+	}
+	id, _ := ctx.Value(gatewayExecutionIDKey{}).(uuid.UUID)
+	return id
+}
+
+// EnsureGatewayExecutionID creates an ID once on the context passed downstream.
+func EnsureGatewayExecutionID(ctx context.Context) (context.Context, uuid.UUID) {
+	if id := GatewayExecutionIDFromContext(ctx); id != uuid.Nil {
+		return ctx, id
+	}
+	id := uuid.New()
+	return context.WithValue(ctx, gatewayExecutionIDKey{}, id), id
+}
 
 // Gin context keys used by Ops error logger for capturing upstream error details.
 // These keys are set by gateway services and consumed by handler/ops_error_logger.go.
@@ -424,6 +448,10 @@ func setOpsUpstreamError(c *gin.Context, upstreamStatusCode int, upstreamMessage
 type OpsUpstreamErrorEvent struct {
 	AtUnixMs int64 `json:"at_unix_ms,omitempty"`
 
+	AttemptSeq   int          `json:"attempt_seq,omitempty"`
+	FailureClass FailureClass `json:"failure_class,omitempty"`
+	ExecutionID  string       `json:"execution_id,omitempty"`
+
 	// Passthrough 表示本次请求是否命中“原样透传（仅替换认证）”分支。
 	// 该字段用于排障与灰度评估；存入 JSON，不涉及 DB schema 变更。
 	Passthrough bool `json:"passthrough,omitempty"`
@@ -628,6 +656,37 @@ func checkSkipMonitoringForUpstreamEvent(c *gin.Context, ev *OpsUpstreamErrorEve
 	if rule != nil && rule.SkipMonitoring {
 		ev.SkipMonitoring = true
 	}
+}
+
+// OpsObserverMaySkipMonitoring checks only possible passthrough suppressions
+// when the observer has a status but never received the response body. Treat
+// a potential keyword match conservatively without reading or retaining bodies.
+func OpsObserverMaySkipMonitoring(c *gin.Context, platform string, status int) bool {
+	if c == nil || status < 400 {
+		return false
+	}
+	svc := getBoundErrorPassthroughService(c)
+	if svc == nil {
+		return false
+	}
+	platform = strings.ToLower(platform)
+	var empty string
+	known := true
+	for _, rule := range svc.getCachedRules() {
+		if !rule.Enabled || !svc.platformMatchesCached(rule, platform) {
+			continue
+		}
+		if svc.ruleMatchesOptimized(rule, status, nil, &empty, &known) {
+			return rule.SkipMonitoring
+		}
+		if !rule.SkipMonitoring || len(rule.lowerKeywords) == 0 {
+			continue
+		}
+		if len(rule.errorCodeSet) == 0 || rule.MatchMode != model.MatchModeAll || svc.containsIntSet(rule.errorCodeSet, status) {
+			return true
+		}
+	}
+	return false
 }
 
 func marshalOpsUpstreamErrors(events []*OpsUpstreamErrorEvent) *string {

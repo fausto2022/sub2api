@@ -2507,11 +2507,17 @@ func (r *accountRepository) SetModelRateLimit(ctx context.Context, id int64, sco
 }
 
 func (r *accountRepository) SetOverloaded(ctx context.Context, id int64, until time.Time) error {
-	_, err := r.client.Account.Update().
-		Where(dbaccount.IDEQ(id)).
-		SetOverloadUntil(until).
-		Save(ctx)
+	result, err := r.sql.ExecContext(ctx, `
+		UPDATE accounts
+		SET overload_until = $1, updated_at = NOW()
+		WHERE id = $2 AND deleted_at IS NULL
+			AND (overload_until IS NULL OR overload_until < $1)
+	`, until, id)
 	if err != nil {
+		return err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil || updated == 0 {
 		return err
 	}
 	if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
@@ -2546,6 +2552,43 @@ func (r *accountRepository) SetTempUnschedulable(ctx context.Context, id int64, 
 	}
 	r.syncSchedulerAccountSnapshot(ctx, id)
 	return nil
+}
+
+// SetTempUnschedulableIfLater returns whether the deadline advanced. A shorter
+// observation leaves the current window and its reason intact. An equal
+// deadline may refresh the reason, and every existing row refreshes its snapshot.
+func (r *accountRepository) SetTempUnschedulableIfLater(ctx context.Context, id int64, until time.Time, reason string) (bool, error) {
+	var extended, changed bool
+	err := scanSingleRow(ctx, r.sql, `
+		WITH current_window AS (
+			SELECT id, temp_unschedulable_until,
+				(temp_unschedulable_until IS NULL OR temp_unschedulable_until < $1) AS extended
+			FROM accounts WHERE id = $3 AND deleted_at IS NULL
+			FOR UPDATE
+		), updated AS (
+			UPDATE accounts AS a
+			SET temp_unschedulable_until = $1, temp_unschedulable_reason = $2, updated_at = NOW()
+			FROM current_window AS w
+			WHERE a.id = w.id AND (w.extended OR
+				(w.temp_unschedulable_until = $1 AND a.temp_unschedulable_reason IS DISTINCT FROM $2))
+			RETURNING a.id
+		)
+		SELECT w.extended, u.id IS NOT NULL FROM current_window AS w
+		LEFT JOIN updated AS u ON u.id = w.id
+	`, []any{until, reason, id}, &extended, &changed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if changed {
+		if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
+			logger.LegacyPrintf("repository.account", "[SchedulerOutbox] enqueue extended temp unschedulable failed: account=%d err=%v", id, err)
+		}
+	}
+	r.syncSchedulerAccountSnapshot(ctx, id)
+	return extended, nil
 }
 
 func (r *accountRepository) SetGrokCredentialTempUnschedulableIfMatch(

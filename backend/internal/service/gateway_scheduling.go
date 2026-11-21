@@ -6,11 +6,13 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	mathrand "math/rand"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
@@ -19,6 +21,302 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/usagestats"
 )
+
+// SetFailoverCooldownStore configures this gateway before serving requests.
+func (s *GatewayService) SetFailoverCooldownStore(store FailoverCooldownStore) {
+	s.failoverCooldownStore = store
+}
+
+type selectionFailoverProbe struct {
+	store  FailoverRecoveryStore
+	policy FailoverPolicy
+	scopes []FailoverCooldownScope
+}
+
+type selectionFailoverProbesKey struct{}
+
+type failoverSelectionSnapshotsKey struct{}
+
+type failoverSelectionSnapshotKey struct {
+	gateway *GatewayService
+	group   int64
+	model   string
+}
+
+type failoverSelectionSnapshot struct {
+	seen map[FailoverCooldownScope]struct{}
+	data FailoverCooldownSnapshot
+}
+
+type failoverSelectionSnapshots struct {
+	mu      sync.Mutex
+	entries map[failoverSelectionSnapshotKey]*failoverSelectionSnapshot
+}
+
+// WithFailoverSelectionSnapshots shares cold and pending observations over one
+// request's load-aware selections. Repeat installation preserves prior reads.
+func WithFailoverSelectionSnapshots(ctx context.Context) context.Context {
+	if _, ok := ctx.Value(failoverSelectionSnapshotsKey{}).(*failoverSelectionSnapshots); ok {
+		return ctx
+	}
+	return context.WithValue(ctx, failoverSelectionSnapshotsKey{}, &failoverSelectionSnapshots{
+		entries: make(map[failoverSelectionSnapshotKey]*failoverSelectionSnapshot),
+	})
+}
+
+func (s *GatewayService) readSelectionRecovery(ctx context.Context, store FailoverRecoveryStore, groupID *int64, model string, scopes []FailoverCooldownScope) FailoverCooldownSnapshot {
+	cache, ok := ctx.Value(failoverSelectionSnapshotsKey{}).(*failoverSelectionSnapshots)
+	if !ok {
+		return store.ReadRecoveryBatch(ctx, scopes)
+	}
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	key := failoverSelectionSnapshotKey{gateway: s, group: derefGroupID(groupID), model: model}
+	observed := cache.entries[key]
+	if observed == nil {
+		observed = &failoverSelectionSnapshot{
+			seen: make(map[FailoverCooldownScope]struct{}, len(scopes)),
+			data: FailoverCooldownSnapshot{
+				Active: make(map[FailoverCooldownScope]FailoverCooldownEntry), Pending: make(map[FailoverCooldownScope]struct{}),
+			},
+		}
+		cache.entries[key] = observed
+	}
+	missing := make([]FailoverCooldownScope, 0, len(scopes))
+	for _, scope := range scopes {
+		if _, exists := observed.seen[scope]; !exists {
+			missing = append(missing, scope)
+		}
+	}
+	if len(missing) != 0 {
+		snapshot := store.ReadRecoveryBatch(ctx, missing)
+		if snapshot.Degraded {
+			return FailoverCooldownSnapshot{Degraded: true}
+		}
+		for _, scope := range missing {
+			observed.seen[scope] = struct{}{}
+			if active, ok := snapshot.Active[scope]; ok {
+				observed.data.Active[scope] = active
+			}
+			if _, ok := snapshot.Pending[scope]; ok {
+				observed.data.Pending[scope] = struct{}{}
+			}
+		}
+	}
+	result := FailoverCooldownSnapshot{Active: make(map[FailoverCooldownScope]FailoverCooldownEntry), Pending: make(map[FailoverCooldownScope]struct{})}
+	for _, scope := range scopes {
+		if active, ok := observed.data.Active[scope]; ok {
+			result.Active[scope] = active
+		}
+		if _, ok := observed.data.Pending[scope]; ok {
+			result.Pending[scope] = struct{}{}
+		}
+	}
+	return result
+}
+
+var (
+	// ErrFailoverProbeNotAdmitted means the caller should release the account slot
+	// and exclude this account for the rest of the current selection sequence.
+	ErrFailoverProbeNotAdmitted  = errors.New("failover probe not admitted")
+	ErrFailoverProbeSlotRequired = errors.New("failover probe requires an acquired account slot")
+)
+
+type selectionIsolationPolicyKey struct{}
+
+func (s *GatewayService) selectionIsolationPolicy(ctx context.Context, groupID *int64) FailoverPolicy {
+	if request := FailoverRequestPolicyFromContext(ctx); request != nil {
+		snapshot, _ := request.Resolve(ctx, groupID)
+		return snapshot.Policy()
+	}
+	if s.cfg != nil {
+		return FailoverPolicyFromConfig(s.cfg.Gateway.FailoverPolicy)
+	}
+	return FailoverPolicy{}
+}
+
+// IsolationEnabled reports whether the result came from an enabled multi-account
+// load-aware selection, rather than the single-account or legacy path.
+func (r *AccountSelectionResult) IsolationEnabled() bool {
+	return r != nil && r.failoverIsolation
+}
+
+// FailoverProbePending reports whether this selection needs a post-slot check.
+func (r *AccountSelectionResult) FailoverProbePending() bool {
+	return r != nil && r.failoverProbe != nil
+}
+
+// AcquireFailoverProbeAfterSlot must be called once per selection after the
+// profit recheck and actual account-slot acquisition. slotRelease must be the
+// release function of that slot (for either an immediate result or a wait plan).
+// Slot ownership remains with the caller on all outcomes.
+func (r *AccountSelectionResult) AcquireFailoverProbeAfterSlot(ctx context.Context, slotRelease func()) ([]FailoverProbeLease, error) {
+	if !r.FailoverProbePending() {
+		return nil, nil
+	}
+	if slotRelease == nil {
+		return nil, ErrFailoverProbeSlotRequired
+	}
+	probe := r.failoverProbe
+	var leases []FailoverProbeLease
+	for _, scope := range probe.scopes {
+		switch acquisition := probe.store.AcquireRecoveryProbe(ctx, scope); acquisition.Status {
+		case FailoverProbeCooling, FailoverProbeBusy:
+			for _, lease := range leases {
+				r.CompleteFailoverProbe(context.WithoutCancel(ctx), lease, FailoverProbeRelease)
+			}
+			return nil, ErrFailoverProbeNotAdmitted
+		case FailoverProbeAcquired:
+			leases = append(leases, acquisition.Lease)
+		case FailoverProbeDegraded:
+			return leases, nil
+		}
+	}
+	return leases, nil
+}
+
+// CompleteFailoverProbe applies an outcome to a lease obtained from this result.
+func (r *AccountSelectionResult) CompleteFailoverProbe(ctx context.Context, lease FailoverProbeLease, outcome FailoverProbeOutcome) FailoverProbeCompletion {
+	if !r.FailoverProbePending() {
+		return FailoverProbeCompletion{}
+	}
+	for _, scope := range r.failoverProbe.scopes {
+		if scope == lease.Scope {
+			return r.failoverProbe.store.CompleteRecoveryProbe(ctx, lease, outcome, &r.failoverProbe.policy)
+		}
+	}
+	return FailoverProbeCompletion{}
+}
+
+func (s *GatewayService) cooledAccountIDsForSelection(ctx context.Context, accounts []Account, requestedModel string) map[int64]struct{} {
+	cooled, _ := s.selectionCooldownSnapshot(ctx, nil, accounts, requestedModel, nil)
+	return cooled
+}
+
+// selectionCooldownSnapshot reads the same account population checked by every
+// load-aware layer. The legacy non-batch selection path never invokes it.
+func (s *GatewayService) selectionCooldownSnapshot(ctx context.Context, groupID *int64, accounts []Account, requestedModel string, excluded map[int64]struct{}) (map[int64]struct{}, map[int64]*selectionFailoverProbe) {
+	if s.failoverCooldownStore == nil || len(accounts) <= 1 || ctx.Err() != nil {
+		return nil, nil
+	}
+	var candidateCount int
+	for i := range accounts {
+		if _, skip := excluded[accounts[i].ID]; !skip {
+			candidateCount++
+		}
+	}
+	_, requestSnapshots := ctx.Value(failoverSelectionSnapshotsKey{}).(*failoverSelectionSnapshots)
+	if candidateCount == 0 || (candidateCount == 1 && !requestSnapshots) {
+		return nil, nil
+	}
+	var policy FailoverPolicy
+	if request := FailoverRequestPolicyFromContext(ctx); request != nil {
+		snapshot, _ := request.Resolve(ctx, groupID)
+		if ctx.Err() != nil {
+			return nil, nil
+		}
+		policy = snapshot.Policy()
+	} else if s.cfg != nil {
+		cfg := s.cfg.Gateway.FailoverPolicy.Cooldown
+		policy.CooldownEnabled = &cfg.Enabled
+		policy.CooldownPoolModeEnabled = &cfg.PoolModeEnabled
+		policy.CooldownProbeEnabled = &cfg.ProbeEnabled
+		policy.CooldownProbeMaxAttempts = &cfg.ProbeMaxAttempts
+		policy.CooldownMaxTTL = &cfg.MaxTTL
+	}
+	if policy.CooldownEnabled == nil || !*policy.CooldownEnabled {
+		return nil, nil
+	}
+
+	allowPool := policy.CooldownPoolModeEnabled != nil && *policy.CooldownPoolModeEnabled
+	eligible := make([]*Account, 0, candidateCount)
+	for i := range accounts {
+		account := &accounts[i]
+		if _, skip := excluded[account.ID]; skip || (!allowPool && account.IsPoolMode()) {
+			continue
+		}
+		eligible = append(eligible, account)
+	}
+	if len(eligible) == 0 {
+		return nil, nil
+	}
+	requestedModel = strings.TrimSpace(requestedModel)
+	store := s.failoverCooldownStore
+	if recovery, ok := store.(FailoverRecoveryStore); ok {
+		scopes := make([]FailoverCooldownScope, 0, len(eligible)*2)
+		for _, account := range eligible {
+			scopes = append(scopes, FailoverCooldownScope{AccountID: account.ID})
+			if requestedModel != "" {
+				if model := selectionCooldownModel(ctx, account, requestedModel); model != "" {
+					scopes = append(scopes, FailoverCooldownScope{AccountID: account.ID, Model: model})
+				}
+			}
+		}
+		snapshot := s.readSelectionRecovery(ctx, recovery, groupID, requestedModel, scopes)
+		if snapshot.Degraded {
+			return nil, nil
+		}
+		cooled := make(map[int64]struct{}, len(snapshot.Active))
+		for _, scope := range scopes {
+			if _, active := snapshot.Active[scope]; active {
+				cooled[scope.AccountID] = struct{}{}
+			}
+		}
+		var probes map[int64]*selectionFailoverProbe
+		if policy.CooldownProbeEnabled != nil && *policy.CooldownProbeEnabled &&
+			policy.CooldownProbeMaxAttempts != nil && *policy.CooldownProbeMaxAttempts > 0 && len(snapshot.Pending) > 0 {
+			probes = make(map[int64]*selectionFailoverProbe)
+			for _, scope := range scopes {
+				if _, active := cooled[scope.AccountID]; active {
+					continue
+				}
+				if _, pending := snapshot.Pending[scope]; pending {
+					probe := probes[scope.AccountID]
+					if probe == nil {
+						probe = &selectionFailoverProbe{store: recovery, policy: policy}
+						probes[scope.AccountID] = probe
+					}
+					probe.scopes = append(probe.scopes, scope)
+				}
+			}
+		}
+		return cooled, probes
+	}
+
+	accountIDs := make([]int64, 0, len(eligible))
+	for _, account := range eligible {
+		accountIDs = append(accountIDs, account.ID)
+	}
+	accountCooled := store.IsCooledBatch(ctx, accountIDs)
+	var modelCooled map[int64]FailoverCooldownEntry
+	if requestedModel != "" {
+		modelCooled = store.IsModelCooledBatch(ctx, accountIDs, requestedModel)
+	}
+	var cooled map[int64]struct{}
+	for _, id := range accountIDs {
+		_, active := accountCooled[id]
+		_, modelActive := modelCooled[id]
+		if active || modelActive {
+			if cooled == nil {
+				cooled = make(map[int64]struct{})
+			}
+			cooled[id] = struct{}{}
+		}
+	}
+	return cooled, nil
+}
+
+func selectionCooldownModel(ctx context.Context, account *Account, requestedModel string) string {
+	switch {
+	case account.Platform == PlatformAntigravity:
+		return strings.TrimSpace(resolveFinalAntigravityModelKey(ctx, account, requestedModel))
+	case account.IsBedrock():
+		model, _ := ResolveBedrockModelID(account, requestedModel)
+		return model
+	default:
+		return strings.TrimSpace(resolveAccountUpstreamModel(account, requestedModel))
+	}
+}
 
 // SelectAccount 选择账号（粘性会话+优先级）
 func (s *GatewayService) SelectAccount(ctx context.Context, groupID *int64, sessionHash string) (*Account, error) {
@@ -97,6 +395,32 @@ func (s *GatewayService) SelectAccountForModelWithExclusions(ctx context.Context
 // SelectAccountWithLoadAwareness selects account with load-awareness and wait plan.
 // metadataUserID: 用于客户端亲和调度，从中提取客户端 ID
 // sub2apiUserID: 系统用户 ID，用于二维亲和调度
+type failoverRetryAccountKey struct{}
+
+// WithFailoverRetryAccount constrains one scheduler pass without emulating sticky affinity.
+func WithFailoverRetryAccount(ctx context.Context, accountID int64) context.Context {
+	if accountID <= 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, failoverRetryAccountKey{}, accountID)
+}
+
+func failoverRetryAccount(ctx context.Context) int64 {
+	if ctx == nil {
+		return 0
+	}
+	id, _ := ctx.Value(failoverRetryAccountKey{}).(int64)
+	return id
+}
+
+func excludesFailoverAccount(ctx context.Context, excluded map[int64]struct{}, accountID int64) bool {
+	if id := failoverRetryAccount(ctx); id > 0 && id != accountID {
+		return true
+	}
+	_, skip := excluded[accountID]
+	return skip
+}
+
 func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, groupID *int64, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}, metadataUserID string, sub2apiUserID int64) (*AccountSelectionResult, error) {
 	// 调试日志：记录调度入口参数
 	excludedIDsList := make([]int64, 0, len(excludedIDs))
@@ -227,6 +551,23 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 	if len(accounts) == 0 {
 		return nil, ErrNoAvailableAccounts
 	}
+	if s.failoverCooldownStore != nil && len(accounts) > 1 {
+		policy := s.selectionIsolationPolicy(ctx, groupID)
+		ctx = context.WithValue(ctx, selectionIsolationPolicyKey{}, policy)
+	}
+	cooledAccountIDs, probes := s.selectionCooldownSnapshot(ctx, groupID, accounts, requestedModel, excludedIDs)
+	isCooled := func(accountID int64) bool {
+		_, cooled := cooledAccountIDs[accountID]
+		return cooled
+	}
+	if len(cooledAccountIDs) > 0 {
+		slog.Debug("account_scheduling_cooldown_filter",
+			"group_id", derefGroupID(groupID), "model", requestedModel,
+			"excluded_reason", "cooldown", "cooled_count", len(cooledAccountIDs), "total_accounts", len(accounts))
+	}
+	if len(probes) > 0 {
+		ctx = context.WithValue(ctx, selectionFailoverProbesKey{}, probes)
+	}
 	ctx = s.withWindowCostPrefetch(ctx, accounts)
 	ctx = s.withRPMPrefetch(ctx, accounts)
 
@@ -236,11 +577,7 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 		accountByID[accounts[i].ID] = &accounts[i]
 	}
 	isExcluded := func(accountID int64) bool {
-		if excludedIDs == nil {
-			return false
-		}
-		_, excluded := excludedIDs[accountID]
-		return excluded
+		return excludesFailoverAccount(ctx, excludedIDs, accountID)
 	}
 
 	// upstream 计费基准的渠道模型限制以账号映射后的上游模型为准，只能逐账号判定；
@@ -280,7 +617,7 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 		var filteredExcluded, filteredMissing, filteredUnsched, filteredPlatform, filteredModelScope, filteredModelMapping, filteredChannelRestricted, filteredWindowCost int
 		var modelScopeSkippedIDs []int64 // 记录因模型限流被跳过的账号 ID
 		for _, routingAccountID := range routingAccountIDs {
-			if isExcluded(routingAccountID) {
+			if isExcluded(routingAccountID) || isCooled(routingAccountID) {
 				filteredExcluded++
 				continue
 			}
@@ -349,7 +686,7 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 					"in_account_map", func() bool { _, ok := accountByID[stickyAccountID]; return ok }(),
 					"session", shortSessionHash(sessionHash),
 				)
-				if containsInt64(routingAccountIDs, stickyAccountID) && !isExcluded(stickyAccountID) {
+				if containsInt64(routingAccountIDs, stickyAccountID) && !isExcluded(stickyAccountID) && !isCooled(stickyAccountID) {
 					// 粘性账号在路由列表中，优先使用
 					if stickyAccount, ok := accountByID[stickyAccountID]; ok {
 						var stickyCacheMissReason string
@@ -565,7 +902,7 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 					"rpm_ok", rpmOK,
 				)
 
-				if !clearSticky && platformOK && profitOK && modelSupported && channelOK && modelSchedulable && quotaOK && windowCostOK && rpmOK && schedulable {
+				if !clearSticky && !isCooled(accountID) && platformOK && profitOK && modelSupported && channelOK && modelSchedulable && quotaOK && windowCostOK && rpmOK && schedulable {
 					result, err := s.tryAcquireAccountSlot(ctx, accountID, account.Concurrency)
 					if err == nil && result.Acquired {
 						// 会话数量限制检查
@@ -649,11 +986,16 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 		"reason", "sticky_not_used_falling_back_to_load_balance",
 		"total_accounts", len(accounts),
 	)
+
 	candidates := make([]*Account, 0, len(accounts))
 	channelRestrictedCount := 0
 	for i := range accounts {
 		acc := &accounts[i]
 		if isExcluded(acc.ID) {
+			continue
+		}
+		// T2 冷却：只移除冷却中的账号，不改变其余候选的相对顺序。
+		if isCooled(acc.ID) {
 			continue
 		}
 		// Scheduler snapshots can be temporarily stale (bucket rebuild is throttled);
@@ -1594,11 +1936,17 @@ func (s *GatewayService) newSelectionResult(ctx context.Context, account *Accoun
 		}
 		return nil, err
 	}
+	probes, _ := ctx.Value(selectionFailoverProbesKey{}).(map[int64]*selectionFailoverProbe)
+	policy, _ := ctx.Value(selectionIsolationPolicyKey{}).(FailoverPolicy)
+	isolation := policy.CooldownEnabled != nil && *policy.CooldownEnabled &&
+		(!hydrated.IsPoolMode() || (policy.CooldownPoolModeEnabled != nil && *policy.CooldownPoolModeEnabled))
 	return attachSelectionProfitGate(ctx, &AccountSelectionResult{
-		Account:     hydrated,
-		Acquired:    acquired,
-		ReleaseFunc: release,
-		WaitPlan:    waitPlan,
+		Account:           hydrated,
+		Acquired:          acquired,
+		ReleaseFunc:       release,
+		WaitPlan:          waitPlan,
+		failoverProbe:     probes[account.ID],
+		failoverIsolation: isolation,
 	}), nil
 }
 
@@ -1931,7 +2279,7 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 		if sessionHash != "" && s.cache != nil {
 			accountID, err := s.cache.GetSessionAccountID(ctx, derefGroupID(groupID), sessionHash)
 			if err == nil && accountID > 0 && containsInt64(routingAccountIDs, accountID) {
-				if _, excluded := excludedIDs[accountID]; !excluded {
+				if !excludesFailoverAccount(ctx, excludedIDs, accountID) {
 					account, err := s.getSchedulableAccount(ctx, accountID)
 					// 检查账号分组归属和平台匹配（确保粘性会话不会跨分组或跨平台）
 					if err == nil {
@@ -1979,7 +2327,7 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 			if _, ok := routingSet[acc.ID]; !ok {
 				continue
 			}
-			if _, excluded := excludedIDs[acc.ID]; excluded {
+			if excludesFailoverAccount(ctx, excludedIDs, acc.ID) {
 				continue
 			}
 			// Scheduler snapshots can be temporarily stale; re-check schedulability here to
@@ -2053,7 +2401,7 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 	if sessionHash != "" && s.cache != nil {
 		accountID, err := s.cache.GetSessionAccountID(ctx, derefGroupID(groupID), sessionHash)
 		if err == nil && accountID > 0 {
-			if _, excluded := excludedIDs[accountID]; !excluded {
+			if !excludesFailoverAccount(ctx, excludedIDs, accountID) {
 				account, err := s.getSchedulableAccount(ctx, accountID)
 				// 检查账号分组归属和平台匹配（确保粘性会话不会跨分组或跨平台）
 				if err == nil {
@@ -2093,7 +2441,7 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 	var selected *Account
 	for i := range accounts {
 		acc := &accounts[i]
-		if _, excluded := excludedIDs[acc.ID]; excluded {
+		if excludesFailoverAccount(ctx, excludedIDs, acc.ID) {
 			continue
 		}
 		// Scheduler snapshots can be temporarily stale; re-check schedulability here to
@@ -2195,7 +2543,7 @@ func (s *GatewayService) selectAccountWithMixedScheduling(ctx context.Context, g
 		if sessionHash != "" && s.cache != nil {
 			accountID, err := s.cache.GetSessionAccountID(ctx, derefGroupID(groupID), sessionHash)
 			if err == nil && accountID > 0 && containsInt64(routingAccountIDs, accountID) {
-				if _, excluded := excludedIDs[accountID]; !excluded {
+				if !excludesFailoverAccount(ctx, excludedIDs, accountID) {
 					account, err := s.getSchedulableAccount(ctx, accountID)
 					// 检查账号分组归属和有效性：原生平台直接匹配，antigravity 需要启用混合调度
 					if err == nil {
@@ -2241,7 +2589,7 @@ func (s *GatewayService) selectAccountWithMixedScheduling(ctx context.Context, g
 			if _, ok := routingSet[acc.ID]; !ok {
 				continue
 			}
-			if _, excluded := excludedIDs[acc.ID]; excluded {
+			if excludesFailoverAccount(ctx, excludedIDs, acc.ID) {
 				continue
 			}
 			// Scheduler snapshots can be temporarily stale; re-check schedulability here to
@@ -2319,7 +2667,7 @@ func (s *GatewayService) selectAccountWithMixedScheduling(ctx context.Context, g
 	if sessionHash != "" && s.cache != nil {
 		accountID, err := s.cache.GetSessionAccountID(ctx, derefGroupID(groupID), sessionHash)
 		if err == nil && accountID > 0 {
-			if _, excluded := excludedIDs[accountID]; !excluded {
+			if !excludesFailoverAccount(ctx, excludedIDs, accountID) {
 				account, err := s.getSchedulableAccount(ctx, accountID)
 				// 检查账号分组归属和有效性：原生平台直接匹配，antigravity 需要启用混合调度
 				if err == nil {
@@ -2356,7 +2704,7 @@ func (s *GatewayService) selectAccountWithMixedScheduling(ctx context.Context, g
 	var selected *Account
 	for i := range accounts {
 		acc := &accounts[i]
-		if _, excluded := excludedIDs[acc.ID]; excluded {
+		if excludesFailoverAccount(ctx, excludedIDs, acc.ID) {
 			continue
 		}
 		// Scheduler snapshots can be temporarily stale; re-check schedulability here to
@@ -2544,7 +2892,7 @@ func (s *GatewayService) diagnoseSelectionFailure(
 	if acc == nil {
 		return selectionFailureDiagnosis{Category: "unschedulable", Detail: "account_nil"}
 	}
-	if _, excluded := excludedIDs[acc.ID]; excluded {
+	if excludesFailoverAccount(ctx, excludedIDs, acc.ID) {
 		return selectionFailureDiagnosis{Category: "excluded"}
 	}
 	if !s.isAccountSchedulableForSelection(acc) {

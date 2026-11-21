@@ -300,13 +300,14 @@ func isOpenAIContextWindowError(upstreamMsg string, upstreamBody []byte) bool {
 	return !gjson.ValidBytes(upstreamBody) && match(string(upstreamBody))
 }
 
+// shouldFailoverUpstreamError 判断是否应换到下一个账号。
+//
+// P1/T1.1：判定收敛到 ClassifyUpstreamFailure（failover_classifier.go），这里只声明
+// OpenAI 网关族。OpenAI 的旧集合比另三处多 402/405（余额耗尽 / 端点不匹配也换号），
+// 这个差异由 FailoverProfileOpenAI 承载（见 failoverProfileExtraClasses），
+// 逐值等价由 failover_legacy_equivalence_test.go 双跑锁定。
 func (s *OpenAIGatewayService) shouldFailoverUpstreamError(statusCode int) bool {
-	switch statusCode {
-	case 401, 402, 403, 405, 429, 529:
-		return true
-	default:
-		return statusCode >= 500
-	}
+	return shouldFailoverStatus(statusCode, FailoverProfileOpenAI)
 }
 
 func (s *OpenAIGatewayService) shouldFailoverOpenAIUpstreamResponse(account *Account, statusCode int, upstreamMsg string, upstreamBody []byte) bool {

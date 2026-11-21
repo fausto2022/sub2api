@@ -273,9 +273,10 @@ describe('PlazaModelPricingTable', () => {
   it('两级表头:实付区与官方区各拆输入/输出/缓存列', () => {
     const wrapper = mountTable([tokenModel()], 1)
     const text = wrapper.text()
-    expect(text).toContain('modelPlaza.table.paidPrice')
+    // 实付区改称「折后价」(design.md §4.3)，与后端的 catalog/discounted 双列口径一致
+    expect(text).toContain('modelPlaza.table.discountedPrice')
     expect(text).toContain('modelPlaza.table.officialPrice')
-    // token 行:模型 + 实付 3 列 + 官方 3 列 + 倍率
+    // token 行:模型 + 实付 3 列 + 官方 3 列 + 倍率（无 catalog/peak 时这两列隐藏）
     expect(wrapper.findAll('tbody td')).toHaveLength(8)
   })
 
@@ -775,5 +776,224 @@ describe('PlazaModelPricingTable 分时计价', () => {
     const wrapper = mountTable([tokenModel()], 1)
     expect(wrapper.findAll('tbody tr')).toHaveLength(1)
     expect(wrapper.find('[title*="modelPlaza.table.timePricingRowHint"]').exists()).toBe(false)
+  })
+})
+
+/**
+ * design.md §4.3：目录价 / 分组倍率 / 折后价 / 官方参考价 / 峰时价五列。
+ *
+ * 核心契约（t28 后端 DTO）：折后价必须优先取后端 `discounted_pricing`，
+ * 它已按生效倍率折算（含登录态专属倍率与图片/视频独立倍率），
+ * 前端不得再乘 `rate_multiplier`，否则专属倍率用户看到的价格与实付不一致。
+ */
+describe('PlazaModelPricingTable 目录价与折后价', () => {
+  /** 目录价 $4 / $16（per token），分组默认倍率 0.8 → 折后 $3.20 / $12.80。 */
+  const CATALOG_INPUT = 4e-6
+  const CATALOG_OUTPUT = 1.6e-5
+
+  function catalogModel(overrides: Partial<PlazaModel> = {}): PlazaModel {
+    return {
+      name: 'kimi-k2',
+      platform: 'moonshot',
+      catalog_pricing: {
+        billing_mode: 'token',
+        input_price: CATALOG_INPUT,
+        output_price: CATALOG_OUTPUT,
+        cache_write_price: null,
+        cache_read_price: null,
+        image_input_price: null,
+        image_output_price: null,
+        per_request_price: null,
+        intervals: []
+      },
+      pricing: {
+        billing_mode: 'token',
+        input_price: CATALOG_INPUT,
+        output_price: CATALOG_OUTPUT,
+        cache_write_price: null,
+        cache_read_price: null,
+        image_input_price: null,
+        image_output_price: null,
+        per_request_price: null,
+        intervals: []
+      },
+      // 后端已乘 0.8
+      discounted_pricing: {
+        billing_mode: 'token',
+        input_price: CATALOG_INPUT * 0.8,
+        output_price: CATALOG_OUTPUT * 0.8,
+        cache_write_price: null,
+        cache_read_price: null,
+        image_input_price: null,
+        image_output_price: null,
+        per_request_price: null,
+        intervals: []
+      },
+      official_pricing: {
+        input_price: 5.6e-7,
+        output_price: 2.24e-6,
+        cache_write_price: null,
+        cache_read_price: null
+      },
+      ...overrides
+    }
+  }
+
+  it('同时展示目录价(未乘倍率)、分组倍率与折后价', () => {
+    const wrapper = mountTable([catalogModel()], 0.8)
+    const text = wrapper.text()
+
+    expect(text).toContain('modelPlaza.table.catalogPrice')
+    expect(text).toContain('modelPlaza.table.discountedPrice')
+    // 目录价原值
+    expect(text).toContain('$4.00')
+    expect(text).toContain('$16.00')
+    // 折后价 4 × 0.8 / 16 × 0.8
+    expect(text).toContain('$3.20')
+    expect(text).toContain('$12.80')
+    // 官方参考价不乘倍率
+    expect(text).toContain('$0.56')
+    expect(text).toContain('$2.24')
+    // 分组倍率
+    expect(text).toContain('0.8x')
+  })
+
+  it('折后价优先用后端 discounted_pricing，不重复乘分组倍率', () => {
+    // 后端给的折后价是 4 × 0.5 = 2.0；若前端再乘 0.5 会得到 1.0（错误）
+    const model = catalogModel({
+      discounted_pricing: {
+        ...catalogModel().discounted_pricing!,
+        input_price: CATALOG_INPUT * 0.5,
+        output_price: CATALOG_OUTPUT * 0.5
+      }
+    })
+    const wrapper = mountTable([model], 0.5)
+    const text = wrapper.text()
+    expect(text).toContain('$2.00')
+    expect(text).toContain('$8.00')
+    // 折后价列不得出现未折算的倍数放大值（1.0 / 4.0）
+    expect(text).not.toContain('$1.00')
+    // 目录价列仍是原值 4 / 16，折后价列是后端给的 2 / 8
+    const cells = wrapper.findAll('tbody td')
+    expect(cells[1].text().trim()).toBe('$4.00 / $16.00')
+    expect(cells[2].text().trim()).toBe('$2.00')
+    expect(cells[3].text().trim()).toBe('$8.00')
+  })
+
+  it('登录态专属倍率下用后端折后价,与分组默认倍率不同也不重算', () => {
+    // 分组默认 1.0，用户专属 0.8：后端已按 0.8 折算出 3.2 / 12.8
+    const wrapper = mountTable([catalogModel()], 1, 0.8)
+    const text = wrapper.text()
+    expect(text).toContain('$3.20')
+    expect(text).toContain('$12.80')
+    // 倍率列划线展示原倍率 + 专属倍率
+    const struck = wrapper.find('td .line-through')
+    expect(struck.exists()).toBe(true)
+    expect(struck.text()).toBe('1x')
+    expect(text).toContain('0.8x')
+  })
+
+  it('catalog_pricing 为 null 的模型在目录价列显示 -，且不影响其他模型', () => {
+    const withCatalog = catalogModel()
+    const withoutCatalog = tokenModel({ name: 'legacy-model', pricing: {
+      billing_mode: 'token',
+      input_price: 1e-6, output_price: 2e-6,
+      cache_write_price: null, cache_read_price: null,
+      image_input_price: null, image_output_price: null,
+      per_request_price: null, intervals: []
+    } })
+    const wrapper = mountTable([withCatalog, withoutCatalog], 0.8)
+    // 有任一模型纳入目录价 → 目录价列渲染
+    expect(wrapper.text()).toContain('modelPlaza.table.catalogPrice')
+    const rows = wrapper.findAll('tbody tr')
+    expect(rows).toHaveLength(2)
+    // 第二列即目录价列；无目录价的模型显示 -
+    const legacyCells = rows.find((r) => r.text().includes('legacy-model'))!.findAll('td')
+    expect(legacyCells[1].text().trim()).toBe('-')
+  })
+
+  it('组内无任何模型纳入目录价时整列隐藏', () => {
+    const wrapper = mountTable([tokenModel()], 1)
+    expect(wrapper.text()).not.toContain('modelPlaza.table.catalogPrice')
+    // 保持旧列数：模型 + 实付 3 + 官方 3 + 倍率
+    expect(wrapper.findAll('tbody td')).toHaveLength(8)
+  })
+
+  it('peak_pricing 存在时渲染峰时价列并按生效倍率折算', () => {
+    const model = catalogModel({
+      peak_pricing: {
+        input_price: 6e-6,
+        output_price: 2.4e-5,
+        cache_write_price: null,
+        cache_read_price: null
+      }
+    })
+    const wrapper = mountTable([model], 0.5)
+    const text = wrapper.text()
+    expect(text).toContain('modelPlaza.table.peakPrice')
+    // 峰价 6 × 0.5 / 24 × 0.5
+    expect(text).toContain('$3.00')
+    expect(text).toContain('$12.00')
+    // 列头 tooltip 说明峰价为未乘倍率的模型级峰价
+    expect(wrapper.find('th[title="modelPlaza.table.peakPriceHint"]').exists()).toBe(true)
+  })
+
+  it('peak_pricing 全为 null 时隐藏峰时价列', () => {
+    const wrapper = mountTable([catalogModel(), tokenModel()], 1)
+    expect(wrapper.text()).not.toContain('modelPlaza.table.peakPrice')
+  })
+
+  it('无 discounted_pricing(旧后端)时回退 pricing × 生效倍率', () => {
+    const model = catalogModel()
+    delete (model as Partial<PlazaModel>).discounted_pricing
+    const wrapper = mountTable([model], 0.8)
+    const text = wrapper.text()
+    // 回退仍得到 4 × 0.8 / 16 × 0.8
+    expect(text).toContain('$3.20')
+    expect(text).toContain('$12.80')
+  })
+
+  it('阶梯折后价按区间配对后端 discounted_pricing.intervals,不按下标错位', () => {
+    const tiers = [
+      { min_tokens: 0, max_tokens: 200000, tier_label: '', input_price: 4e-6, output_price: 1.6e-5, cache_write_price: null, cache_read_price: null, per_request_price: null },
+      { min_tokens: 200000, max_tokens: null, tier_label: '', input_price: 8e-6, output_price: 3.2e-5, cache_write_price: null, cache_read_price: null, per_request_price: null }
+    ]
+    const model = catalogModel({
+      pricing: { ...catalogModel().pricing!, intervals: tiers },
+      discounted_pricing: {
+        ...catalogModel().discounted_pricing!,
+        intervals: tiers.map((t) => ({
+          ...t,
+          input_price: (t.input_price ?? 0) * 0.5,
+          output_price: (t.output_price ?? 0) * 0.5
+        }))
+      }
+    })
+    const wrapper = mountTable([model], 0.5)
+    const text = wrapper.text()
+    // 档位标签
+    expect(text).toContain('≤200K')
+    expect(text).toContain('>200K')
+    // 低档 4 × 0.5 = 2；高档 8 × 0.5 = 4
+    expect(text).toContain('$2.00')
+    expect(text).toContain('$4.00')
+    expect(text).toContain('$8.00')
+    expect(text).toContain('$16.00')
+  })
+
+  it('分时时段行的折后价 = 后端折后价 × 时段倍率', () => {
+    const model = catalogModel({
+      time_pricing: {
+        timezone: 'Asia/Shanghai',
+        periods: [{ start_time: '00:30', end_time: '08:30', multiplier: 0.5 }]
+      }
+    })
+    const wrapper = mountTable([model], 0.8)
+    const rows = wrapper.findAll('tbody tr')
+    expect(rows).toHaveLength(2)
+    // 标准行：后端折后价 3.2
+    expect(rows[0].findAll('td')[2].text()).toContain('$3.20')
+    // 时段行：3.2 × 0.5 = 1.6（而非 目录价 4 × 0.8 × 0.5 的重复折算）
+    expect(rows[1].findAll('td')[2].text()).toContain('$1.60')
   })
 })

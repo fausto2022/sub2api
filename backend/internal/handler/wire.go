@@ -47,6 +47,9 @@ func ProvideAdminHandlers(
 	affiliateHandler *admin.AffiliateHandler,
 	complianceHandler *admin.ComplianceHandler,
 	auditLogHandler *admin.AuditLogHandler,
+	ticketHandler *admin.TicketHandler,
+	modelPricingHandler *admin.ModelPricingHandler,
+	opsMgmtHandler *admin.OpsMgmtHandler,
 	upstreamBillingProbe *service.UpstreamBillingProbeService,
 	ollamaCloudUsage *service.OllamaCloudUsageService,
 	opencodeGoUsage *service.OpenCodeGoUsageService,
@@ -93,6 +96,9 @@ func ProvideAdminHandlers(
 		Affiliate:              affiliateHandler,
 		Compliance:             complianceHandler,
 		AuditLog:               auditLogHandler,
+		Ticket:                 ticketHandler,
+		ModelPricing:           modelPricingHandler,
+		OpsMgmt:                opsMgmtHandler,
 	}
 }
 
@@ -114,7 +120,13 @@ func ProvideGatewayHandler(
 	settingService *service.SettingService,
 	coordinator *securityaudit.Coordinator,
 	geminiCachedContentService *service.GeminiCachedContentService,
+	failoverPolicyReader service.GroupFailoverPolicyReader,
+	failoverCooldownStore service.FailoverCooldownStore,
 ) *GatewayHandler {
+	gatewayService.ConfigureFailoverRouting(failoverPolicyReader, failoverCooldownStore)
+	gatewayService.EnableHTTPFailoverObservation()
+	geminiCompatService.EnableHTTPFailoverObservation()
+	service.SetFailoverDecisionGate(cfg != nil && cfg.Gateway.FailoverPolicy.Enabled && cfg.Gateway.FailoverPolicy.SideEffectsDeferred)
 	h := NewGatewayHandler(gatewayService, openAIGatewayService, geminiCompatService, antigravityGatewayService,
 		userService, concurrencyService, billingCacheService, usageService, apiKeyService, usageRecordWorkerPool,
 		errorPassthroughService, contentModerationService, userMsgQueueService, cfg, settingService)
@@ -139,12 +151,30 @@ func ProvideOpenAIGatewayHandler(
 	compositeResolver *service.CompositeRouteResolver,
 ) *OpenAIGatewayHandler {
 	gatewayService.SetPluginManager(pluginManager)
+	gatewayService.EnableHTTPFailoverObservation()
 	h := NewOpenAIGatewayHandler(gatewayService, concurrencyService, billingCacheService, apiKeyService,
 		usageRecordWorkerPool, errorPassthroughService, contentModerationService, opsService, cfg)
 	h.compositeResolver = compositeResolver
 	h.securityAuditCoordinator = coordinator
 	h.grokMediaEligibilityProber = grokQuotaService
 	return h
+}
+
+// InstallUpstreamCostAttemptRecorder is called during application assembly, before traffic.
+func (h *GatewayHandler) InstallUpstreamCostAttemptRecorder(recorder *service.UpstreamCostAttemptRecorder) {
+	if recorder != nil {
+		h.gatewayService.EnableHTTPFailoverObservation()
+		h.geminiCompatService.EnableHTTPFailoverObservation()
+	}
+	h.upstreamCostRecorder = recorder
+}
+
+// InstallUpstreamCostAttemptRecorder shares the worker with the other HTTP gateway.
+func (h *OpenAIGatewayHandler) InstallUpstreamCostAttemptRecorder(recorder *service.UpstreamCostAttemptRecorder) {
+	if recorder != nil {
+		h.gatewayService.EnableHTTPFailoverObservation()
+	}
+	h.upstreamCostRecorder = recorder
 }
 
 func ProvideBatchImageHandler(
@@ -203,6 +233,8 @@ func ProvideHandlers(
 	modelPlazaHandler *ModelPlazaHandler,
 	asyncImageHandler *AsyncImageHandler,
 	batchImageHandler *BatchImageHandler,
+	ticketHandler *TicketHandler,
+	ticketAttachmentHandler *TicketAttachmentHandler,
 	_ *service.IdempotencyCoordinator,
 	_ *service.IdempotencyCleanupService,
 	_ *service.OpenAIQuotaAutoResetService,
@@ -230,6 +262,8 @@ func ProvideHandlers(
 		ModelPlaza:       modelPlazaHandler,
 		AsyncImage:       asyncImageHandler,
 		BatchImage:       batchImageHandler,
+		Ticket:           ticketHandler,
+		TicketAttachment: ticketAttachmentHandler,
 	}
 }
 
@@ -257,6 +291,8 @@ var ProviderSet = wire.NewSet(
 	NewModelPlazaHandler,
 	NewAsyncImageHandler,
 	ProvideBatchImageHandler,
+	NewTicketHandler,
+	NewTicketAttachmentHandler,
 
 	// Admin handlers
 	admin.NewDashboardHandler,
@@ -294,6 +330,8 @@ var ProviderSet = wire.NewSet(
 	admin.NewAffiliateHandler,
 	admin.NewComplianceHandler,
 	admin.NewAuditLogHandler,
+	admin.NewTicketHandler,
+	admin.NewModelPricingHandler,
 
 	// AdminHandlers and Handlers constructors
 	ProvideAdminHandlers,

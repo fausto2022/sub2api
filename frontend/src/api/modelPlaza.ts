@@ -47,8 +47,21 @@ export interface PlazaTimePricing {
 export interface PlazaModel {
   name: string
   platform: string
+  /**
+   * 模型目录价（管理员在「模型价格」页配置，未乘倍率）；未纳入目录价时为 null。
+   * 目录价层接管时 pricing 与它同源，但未接管时 pricing 是真渠道/分组价。
+   */
+  catalog_pricing?: UserSupportedModelPricing | null
   /** 实收口径的展示定价：档位可提供绝对单价或相对基础价倍率；均为标准时段价。 */
   pricing: UserSupportedModelPricing | null
+  /**
+   * 折后价 = 展示单价 × 生效倍率，由后端预计算。
+   * 已含登录态专属倍率与图片/视频独立倍率，前端直接展示，不得再乘一次倍率；
+   * 未纳入目录价或旧后端不返回时为 null（回退前端 pricing × rate 口径）。
+   */
+  discounted_pricing?: UserSupportedModelPricing | null
+  /** 模型级自定义高峰价（未乘倍率）；未启用峰谷时为 null，前端隐藏该列。 */
+  peak_pricing?: PlazaOfficialPricing | null
   official_pricing: PlazaOfficialPricing | null
   /** 仅多档模型返回。 */
   long_context_basis?: PlazaLongContextBasis
@@ -79,6 +92,8 @@ export interface ModelPlazaGroup {
   video_rate_multiplier: number
   /** 分组是否启用长上下文阶梯计费；false 时实付列只展示最低档，官方阶梯仅供参考。 */
   long_context_pricing_enabled: boolean
+  /** 本分组中价格来自模型目录价层的模型数（未纳入目录价的不计入）。 */
+  catalog_model_count?: number
   models: PlazaModel[]
 }
 

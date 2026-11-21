@@ -749,6 +749,9 @@ type PricingConfig struct {
 	FallbackFile string `mapstructure:"fallback_file"`
 	// 覆盖补丁文件路径（可选）：条目按字段浅合并覆盖目录/回退数据，优先级最高
 	OverrideFile string `mapstructure:"override_file"`
+	// 人民币计费口径层文件路径（可选）：逐模型的人民币原生价，先于 USD override
+	// 换算叠加。为空时按 override_file 同目录、再按 data_dir 推导 cny-overrides.json。
+	CNYOverrideFile string `mapstructure:"cny_override_file"`
 	// 更新间隔（小时）
 	UpdateIntervalHours int `mapstructure:"update_interval_hours"`
 	// 哈希校验间隔（分钟）
@@ -1196,6 +1199,11 @@ type GatewayConfig struct {
 	// Antigravity 429 fallback 限流时间（分钟），解析重置时间失败时使用
 	AntigravityFallbackCooldownMinutes int `mapstructure:"antigravity_fallback_cooldown_minutes"`
 
+	// FailoverPolicy: 账号级容灾策略（判定规则/预算/冷却/切换顺序/终态）。
+	// 全部新键的默认值 = 改造前的现状行为（零默认行为变更）；分组级与账号级覆盖
+	// 优先级高于本层，见 service.ResolveFailoverPolicy。
+	FailoverPolicy GatewayFailoverPolicyConfig `mapstructure:"failover_policy"`
+
 	// Scheduling: 账号调度相关配置
 	Scheduling GatewaySchedulingConfig `mapstructure:"scheduling"`
 
@@ -1624,6 +1632,339 @@ type GatewaySchedulingConfig struct {
 	FullRebuildIntervalSeconds int `mapstructure:"full_rebuild_interval_seconds"`
 }
 
+// ---------------------------------------------------------------------------
+// 网关账号级 failover 策略（design.md §5.1 配置清单 / implementation.md T0.1）
+//
+// 核心约定：**全部默认值 = 改造前的现状行为**（implementation.md §1.6「配置兼容
+// 基线表」），因此「不配置 gateway.failover_policy」时升级前后的可观测行为逐位一致。
+// 这是「发布 B = 发布 A」回滚保障的硬前提；任何默认值改动都必须先在
+// openspec/changes/gateway-account-failover/implementation.md §1.5 登记为行为变更。
+//
+// 三级覆盖：本结构是**全局层**（第 3 层，优先级最低），字段一律用值类型（全局永远
+// 有值）。分组层（groups.failover_on_400 / failover_max_account_switches /
+// failover_policy）与账号层（accounts.credentials["failover_policy"]）用指针字段
+// 表达「未设置（nil）」，三者由 service.ResolveFailoverPolicy 做**字段级 merge**
+// （不是对象级覆盖）。禁止用零值表示「未设置」：failover_on_400 的 false 本身是
+// 有效语义，必须与「未配置」区分（design §3.3.5）。
+//
+// 本块的默认值一共 **34 个标量键 + `status_classes` 规则表 = 35 个配置键**。
+// 逐键断言见
+// `backend/internal/config/config_test.go` 的
+// `TestFailoverPolicyDefaultsMatchCurrentBehaviorState`——改默认值必须同步改那张
+// 期望表，否则测试会红。
+//
+// —— 值班必读：四条踩坑提醒（均已实测核实，改注释勿删） ——
+//
+//  1. **环境变量前缀**：本配置块**没有** `SUB2API_` 前缀。`config.go` 从未调用
+//     `viper.SetEnvPrefix`（全 backend 零命中），viper 只做「点 → 下划线 + 大写」
+//     的映射，因此真实形态是 `GATEWAY_FAILOVER_POLICY_<路径大写>`，例如
+//     `GATEWAY_FAILOVER_POLICY_COOLDOWN_ENABLED=false`、
+//     `GATEWAY_FAILOVER_POLICY_BUDGET_TOTAL_TIMEOUT=120s`。
+//     openspec/changes/gateway-account-failover/implementation.md T0.1 里写的
+//     `SUB2API_GATEWAY_FAILOVER_POLICY_*` 是笔误，照抄会得到「设了却不生效」。
+//     例外：`status_classes` 是 []struct，viper 的环境变量通路无法表达结构化切片
+//     （见 `env_reachability_test.go` 的说明），只能走配置文件。
+//
+//  2. **配置不热加载**：本仓库没有 `viper.WatchConfig` / fsnotify / OnConfigChange
+//     （全 backend 零命中）。改完配置必须**滚动重启**进程才生效——所以「回滚 = 改配置」
+//     的真实动作是「改配置 + 重启」，不是纯配置动作。重启前必须满足的校验组合与
+//     完整操作步骤见 `openspec/changes/gateway-account-failover/rollout.md` §9。
+//
+//  3. **`cooldown.fail_open=false` 会让进程拒绝启动**：这是本块唯一被 Validate 硬
+//     拒绝的键（见 `validateGatewayFailoverPolicy`）。启动阶段 `load()` 会打印
+//     `validate config error: gateway.failover_policy.cooldown.fail_open must be true
+//     (fail-closed cooldown is unsafe)` 并退出。想关冷却请用 `cooldown.enabled=false`，
+//     **不要**去动 `fail_open`。
+//
+//  4. **默认状态码集合是「双同构表」**：本文件的 `DefaultFailoverStatusClasses()`
+//     与 `service/failover_classifier.go` 的 `defaultFailoverClassRules()` 是两份
+//     必须人工同步的实现。改默认状态码集合时**两处必须一起改**，否则
+//     `backend/internal/config/failover_status_classes_sync_test.go` 会变红
+//     （它按 100–599 全状态码逐码比对两侧类别）。
+// ---------------------------------------------------------------------------
+
+// failover 失败类别名（design.md §3.3.2）。作为配置值出现，必须是稳定的
+// 小写下划线字符串；新增类别只需在分类器侧登记，配置层只校验形状不校验枚举。
+const (
+	FailoverClassAuthInvalid     = "auth_invalid"
+	FailoverClassRateLimited     = "rate_limited"
+	FailoverClassQuotaExhausted  = "quota_exhausted"
+	FailoverClassCapacityShed    = "capacity_shed"
+	FailoverClassUpstream5xx     = "upstream_5xx"
+	FailoverClassUpstreamTimeout = "upstream_timeout"
+	FailoverClassNetwork         = "network"
+	FailoverClassRequestInvalid  = "request_invalid"
+	FailoverClassPolicyBlocked   = "policy_blocked"
+	FailoverClassBindingPassthru = "binding_passthru"
+)
+
+// failover 同账号重试模式（gateway.failover_policy.same_account.default_mode）。
+const (
+	// FailoverSameAccountModeInherit 沿用账号凭据的 pool_mode_retry_count /
+	// pool_mode_retry_status_codes 与错误对象上的 RetryableOnSameAccount 标志，
+	// 行为与改造前完全一致（默认值）。
+	FailoverSameAccountModeInherit = "inherit"
+	// FailoverSameAccountModeOff 关闭同账号重试（只换号）。
+	FailoverSameAccountModeOff = "off"
+)
+
+// failover 失败归属（RetryAdvice.Scope）。
+const (
+	failoverScopeAccount  = "account"
+	failoverScopeProvider = "provider"
+	failoverScopeRequest  = "request"
+)
+
+// failover 冷却时长来源（RetryAdvice.CooldownSource）。
+const (
+	failoverCooldownSourceUpstreamReset = "upstream_reset"
+	failoverCooldownSourceFixed         = "fixed"
+	failoverCooldownSourceNone          = "none"
+)
+
+// failover 配置的取值范围上界（design.md §5.1「范围」列）。
+const (
+	maxFailoverCompat400Keywords  = 64
+	maxFailoverTotalTimeout       = 1800 * time.Second
+	maxFailoverPerAccountTimeout  = 600 * time.Second
+	maxFailoverBudgetAttempts     = 50
+	maxFailoverMinSwitchCost      = 30 * time.Second
+	maxFailoverFirstOutputTimeout = 600
+	minFailoverFirstOutputTimeout = 30
+	maxFailoverCooldownThreshold  = 20
+	minFailoverStreakWindow       = 10 * time.Second
+	maxFailoverStreakWindow       = time.Hour
+	minFailoverDefaultTTL         = time.Second
+	maxFailoverDefaultTTL         = time.Hour
+	minFailoverMaxTTL             = time.Minute
+	maxFailoverMaxTTL             = 24 * time.Hour
+	maxFailoverProbeAttempts      = 10
+	minFailoverRedisTimeout       = 50 * time.Millisecond
+	maxFailoverRedisTimeout       = 5 * time.Second
+	maxFailoverBatchReadMax       = 1000
+	maxFailoverSelectionRetries   = 5
+	failoverStatusCodeMin         = 100
+	failoverStatusCodeMax         = 599
+)
+
+// FailoverRetryAdviceConfig 是某个失败类别的「处置建议」覆盖。
+// 指针字段 nil = 未设置，落在该类别的内置默认建议上（内置默认 = 改造前现状）。
+type FailoverRetryAdviceConfig struct {
+	// Failover 是否允许换到同组的下一个账号。
+	Failover *bool `mapstructure:"failover"`
+	// SameAccount 同账号重试策略：inherit / off / 具体次数（十进制字符串）。
+	SameAccount *string `mapstructure:"same_account"`
+	// Cooldown T2 跨请求冷却时长；0 = 不冷却。
+	Cooldown *time.Duration `mapstructure:"cooldown"`
+	// CooldownSource 冷却时长来源：upstream_reset / fixed / none。
+	CooldownSource *string `mapstructure:"cooldown_source"`
+	// TempUnschedule 是否走 T3 写库标记（TempUnschedulable）。
+	TempUnschedule *bool `mapstructure:"temp_unschedule"`
+	// ClearSticky 是否清粘性绑定（B2 的类别级开关）。
+	ClearSticky *bool `mapstructure:"clear_sticky"`
+	// Scope 失败归属：account / provider / request。
+	Scope *string `mapstructure:"scope"`
+}
+
+// FailoverStatusClassRuleConfig 是一条失败分类规则（design.md §3.3.2 Rule Model）。
+// 规则表**按顺序先匹配先命中**，顺序本身是契约（例如 429 必须排在 500-599 之前），
+// 不要重排。
+type FailoverStatusClassRuleConfig struct {
+	// Class 失败类别名，取值见上面的 FailoverClass* 常量。
+	Class string `mapstructure:"class"`
+	// Codes 精确匹配的状态码列表（100–599）。
+	Codes []int `mapstructure:"codes"`
+	// Ranges 闭区间状态码段，形如 "500-599"。
+	Ranges []string `mapstructure:"ranges"`
+	// Advice 该类别的处置建议覆盖；nil = 使用类别内置默认建议。
+	Advice *FailoverRetryAdviceConfig `mapstructure:"advice"`
+}
+
+// FailoverNetworkErrorsConfig 网络层失败（拨号/TLS/连接重置/EOF/超时）分类开关。
+type FailoverNetworkErrorsConfig struct {
+	// Enabled 网络层是否参与分类（改造前已参与，故默认 true）。
+	Enabled bool `mapstructure:"enabled"`
+}
+
+// FailoverSameAccountConfig 同账号重试的默认策略。
+type FailoverSameAccountConfig struct {
+	// DefaultMode inherit（默认，沿用 pool_mode*）/ off。
+	DefaultMode string `mapstructure:"default_mode"`
+}
+
+// FailoverBudgetConfig 时间与次数预算层（design.md §3.2）。
+// 默认全关 = 现状；min_switch_cost 只在 Deadline 非零（预算已开启）时生效。
+type FailoverBudgetConfig struct {
+	// TotalTimeout 整请求总预算；0 = 关闭。
+	TotalTimeout time.Duration `mapstructure:"total_timeout"`
+	// PerAccountTimeout 单账号预算；0 = 关闭。
+	PerAccountTimeout time.Duration `mapstructure:"per_account_timeout"`
+	// MaxTotalUpstreamAttempts 整请求上游调用总次数硬顶；0 = 关闭。
+	MaxTotalUpstreamAttempts int `mapstructure:"max_total_upstream_attempts"`
+	// MaxSameAccountAttemptsTotal 整请求同账号重试合计上限（不是每账号）；0 = 关闭。
+	MaxSameAccountAttemptsTotal int `mapstructure:"max_same_account_attempts_total"`
+	// MinSwitchCost 切换前剩余预算下限；不足则不切（直接返回错误更快）。
+	MinSwitchCost time.Duration `mapstructure:"min_switch_cost"`
+	// StopClockOnStream 首语义字节后停止计时（流式请求不应被预算截断）。
+	StopClockOnStream bool `mapstructure:"stop_clock_on_stream"`
+}
+
+// FailoverCooldownConfig T2 跨请求冷却层（design.md §3.4/§3.5，依赖 Redis）。
+type FailoverCooldownConfig struct {
+	// Enabled T2 总开关（默认关闭；关闭时零 Redis RTT）。
+	Enabled bool `mapstructure:"enabled"`
+	// ConsecutiveFailuresThreshold 连续失败多少次才写冷却。
+	ConsecutiveFailuresThreshold int `mapstructure:"consecutive_failures_threshold"`
+	// StreakWindow 连续失败计数窗口。
+	StreakWindow time.Duration `mapstructure:"streak_window"`
+	// DefaultTTL 默认冷却时长。
+	DefaultTTL time.Duration `mapstructure:"default_ttl"`
+	// MaxTTL 上游 reset 时间的截断上限。
+	MaxTTL time.Duration `mapstructure:"max_ttl"`
+	// PoolModeEnabled 池模式账号是否也受 T2 约束。
+	PoolModeEnabled bool `mapstructure:"pool_mode_enabled"`
+	// ProbeEnabled 半开探测。
+	ProbeEnabled bool `mapstructure:"probe_enabled"`
+	// ProbeMaxAttempts 半开探测次数上限。
+	ProbeMaxAttempts int `mapstructure:"probe_max_attempts"`
+	// RedisTimeout 单次 Redis 读写超时。
+	RedisTimeout time.Duration `mapstructure:"redis_timeout"`
+	// FailOpen Redis 不可用时是否 fail-open。**必须为 true**：设成 false 会让进程
+	// **拒绝启动**（Validate 硬校验，本配置块唯一被拒的键）。想关冷却请改
+	// cooldown.enabled=false，不要动本键；重启前校验见 rollout.md §9。
+	FailOpen bool `mapstructure:"fail_open"`
+	// BatchReadMax 冷却状态批量读（MGET）上限。
+	BatchReadMax int `mapstructure:"batch_read_max"`
+}
+
+// FailoverSwitchOrderConfig 切换顺序与粘性处理。
+type FailoverSwitchOrderConfig struct {
+	// RecordChain 是否产出切换链（switch_chain，纯日志/观测）。
+	RecordChain bool `mapstructure:"record_chain"`
+	// ClearStickyOnAccountFailure 账号级失败是否清粘性绑定（B2）。
+	ClearStickyOnAccountFailure bool `mapstructure:"clear_sticky_on_account_failure"`
+}
+
+// FailoverSwitchableConfig 可切换判据（design.md §3.6）。
+type FailoverSwitchableConfig struct {
+	// UseSemanticBytes 用「已写出的语义字节」而不是 Writer.Size() 判断是否还能换号（B1）。
+	UseSemanticBytes bool `mapstructure:"use_semantic_bytes"`
+	// TreatKeepaliveAsSafe keepalive / 空注释行不计入语义字节。
+	TreatKeepaliveAsSafe bool `mapstructure:"treat_keepalive_as_safe"`
+}
+
+// FailoverIdempotencyConfig 有副作用请求的幂等审计（design.md §3.6.4）。
+type FailoverIdempotencyConfig struct {
+	// RequireKeyForSideEffecting 有副作用的请求是否强制要求幂等键（默认不强制）。
+	RequireKeyForSideEffecting bool `mapstructure:"require_key_for_side_effecting"`
+	// BlockedTools 命中即禁止换号的工具名列表（默认空）。
+	BlockedTools []string `mapstructure:"blocked_tools"`
+}
+
+// FailoverT3Config T3（写库标记）相关的窄开关。
+type FailoverT3Config struct {
+	// OnlyExtend 只延长不缩短 TempUnschedulable（DB 侧已有 extend-only 守卫，默认 true）。
+	OnlyExtend bool `mapstructure:"only_extend"`
+}
+
+// FailoverTerminalConfig 终局错误合成策略（design.md §3.8.4）。
+type FailoverTerminalConfig struct {
+	// MixedStatus503 混合类别终局错误是否统一成 503 + Retry-After（B3）。
+	// 默认 false：用户尚未裁决 B3（503 会改变客户端退避行为），因此按「零默认
+	// 行为变更」保守取值，P5（T5.4）确认后再翻为 true。
+	// 翻这个开关属于**改配置 + 滚动重启**，不需要发版（见 rollout.md §9）。
+	MixedStatus503 bool `mapstructure:"mixed_status_503"`
+}
+
+// FailoverCostAttemptsConfig 成本尝试账本（P6，独立发布，默认不写）。
+type FailoverCostAttemptsConfig struct {
+	// Enabled 是否写 cost_attempts 账本（默认不写，扣费条数不变）。
+	Enabled bool `mapstructure:"enabled"`
+}
+
+// GatewayFailoverPolicyConfig 是 `gateway.failover_policy` 配置块。
+// 字段与 design.md §5.1 的表一一对应（34 个标量键 + status_classes 规则表）。
+type GatewayFailoverPolicyConfig struct {
+	// Enabled 策略层总开关。false = 全部走改造前的硬编码判定路径（回滚开关）。
+	Enabled bool `mapstructure:"enabled"`
+	// SideEffectsDeferred applies account-level failure effects after the request decides to switch.
+	// It defaults to false and is disabled when the policy kill switch is off.
+	SideEffectsDeferred bool `mapstructure:"side_effects_deferred"`
+	// StatusClasses 失败分类规则表。整体替换型覆盖：配置了就整表替换，不与内置表
+	// 按条目合并。nil = 使用内置默认表 DefaultFailoverStatusClasses()。
+	// 改默认表时必须**同时**改 service/failover_classifier.go 的
+	// defaultFailoverClassRules，否则 failover_status_classes_sync_test.go 变红
+	// （双同构表约束，见上方块注释第 4 条）。
+	StatusClasses []FailoverStatusClassRuleConfig `mapstructure:"status_classes"`
+	// NetworkErrors 网络层错误是否参与分类。
+	NetworkErrors FailoverNetworkErrorsConfig `mapstructure:"network_errors"`
+	// FailoverOn400 是否允许对「400 + 兼容性关键词白名单」换号。
+	// 兼容旧键 gateway.failover_on_400：新键优先；两者都为 false 时行为 = 现状。
+	FailoverOn400 bool `mapstructure:"failover_on_400"`
+	// Compat400Keywords 400 兼容性关键词白名单。默认 9 个，与改造前
+	// shouldFailoverOn400（gateway_upstream_response.go:212-237）的判断集合一致。
+	Compat400Keywords []string `mapstructure:"compat_400_keywords"`
+	// SameAccount 同账号重试的默认策略。
+	SameAccount FailoverSameAccountConfig `mapstructure:"same_account"`
+	// Budget 时间与次数预算层。
+	Budget FailoverBudgetConfig `mapstructure:"budget"`
+	// FirstOutputTimeoutSeconds L1 首语义字节超时（秒）；0 = 关闭（现状）。
+	FirstOutputTimeoutSeconds int `mapstructure:"first_output_timeout_seconds"`
+	// Cooldown T2 跨请求冷却层。注意子键 fail_open 必须为 true（false 会拒绝启动）。
+	Cooldown FailoverCooldownConfig `mapstructure:"cooldown"`
+	// SwitchOrder 切换顺序与粘性处理。
+	SwitchOrder FailoverSwitchOrderConfig `mapstructure:"switch_order"`
+	// MaxSelectionRetries 排除集清空次数上限（活锁护栏）。0 = 现状（不额外限制）。
+	// 注意：默认 0 而不是 design §3.1.5 写的 1（implementation.md §1.3-D1 裁决）——
+	// 改成 1 会成为第 4 项默认行为变更，破坏「发布 B = 发布 A」的回滚前提；
+	// 发布手册把 1 作为**建议开启值**给运维按分组灰度（rollout.md §3.7）。
+	MaxSelectionRetries int `mapstructure:"max_selection_retries"`
+	// Switchable 可切换判据。
+	Switchable FailoverSwitchableConfig `mapstructure:"switchable"`
+	// Idempotency 有副作用请求的幂等审计。
+	Idempotency FailoverIdempotencyConfig `mapstructure:"idempotency"`
+	// T3 T3（写库标记）相关的窄开关。
+	T3 FailoverT3Config `mapstructure:"t3"`
+	// ExposeFailoverDetail 终局错误是否向客户端暴露尝试明细（默认不暴露）。
+	ExposeFailoverDetail bool `mapstructure:"expose_failover_detail"`
+	// Terminal 终局错误合成策略。
+	Terminal FailoverTerminalConfig `mapstructure:"terminal"`
+	// CostAttempts 成本尝试账本。
+	CostAttempts FailoverCostAttemptsConfig `mapstructure:"cost_attempts"`
+}
+
+// DefaultFailoverStatusClasses 返回失败分类规则表的默认值（design.md §3.3.2
+// 「默认规则表」），与改造前 4 处硬编码状态码集合逐项等价：
+//
+//	gateway_forward.go:shouldFailoverUpstreamError → {401,403,429,529} ∪ [500,∞)
+//	antigravity_gateway_retry.go                   → 同上
+//	gemini_messages_compat_service.go              → 同上 + {429,500,502,503,504,529}
+//	openai_gateway_upstream_errors.go              → 自有分类（capacity shed / credential / 400）
+//
+// 权重说明：Advice 一律留 nil，表示落在各类别的内置默认建议（= 现状）；
+// 配置层只承载「状态码 → 类别」的映射，避免把分类器的处置表提前固化在配置里。
+// **顺序即判定顺序（先匹配先命中）**，不要重排。
+//
+// 为什么导出：分类器（service/failover_classifier.go 的 defaultFailoverClassRules）
+// 与这张表是**两份同构实现**，必须人工保持同步，却没有编译期约束。导出后由
+// `backend/internal/config/failover_status_classes_sync_test.go`（外部测试包
+// config_test，可同时 import config 与 service）逐条比对两份表，任一侧单边改动即变红。
+// 该测试是这张表的**守卫**：改这里必须让它继续绿，否则说明两表已漂移。
+func DefaultFailoverStatusClasses() []FailoverStatusClassRuleConfig {
+	return []FailoverStatusClassRuleConfig{
+		{Class: FailoverClassAuthInvalid, Codes: []int{401, 403}},
+		{Class: FailoverClassRateLimited, Codes: []int{429}},
+		{Class: FailoverClassQuotaExhausted, Codes: []int{529}},
+		{Class: FailoverClassCapacityShed, Codes: []int{503}},
+		{Class: FailoverClassUpstream5xx, Codes: []int{500, 502, 504}, Ranges: []string{"500-599"}},
+		{Class: FailoverClassUpstreamTimeout},
+		{Class: FailoverClassNetwork},
+		{Class: FailoverClassRequestInvalid, Codes: []int{400, 404, 409, 413, 422}},
+		{Class: FailoverClassPolicyBlocked},
+		{Class: FailoverClassBindingPassthru},
+	}
+}
+
 func (s *ServerConfig) Address() string {
 	return fmt.Sprintf("%s:%d", s.Host, s.Port)
 }
@@ -1947,6 +2288,12 @@ func load(allowMissingJWTSecret bool) (*Config, error) {
 	var cfg Config
 	if err := viper.Unmarshal(&cfg); err != nil {
 		return nil, fmt.Errorf("unmarshal config error: %w", err)
+	}
+	// status_classes 是 []struct，viper 只支持标量切片的环境变量通路（结构化切片
+	// 属于「仅配置文件」），因此默认规则表在这里落地而不是 SetDefault：
+	// 未配置 → 内置默认表（= 改造前硬编码集合）；显式配置 [] → 保持空（"一条规则都没有"）。
+	if cfg.Gateway.FailoverPolicy.StatusClasses == nil {
+		cfg.Gateway.FailoverPolicy.StatusClasses = DefaultFailoverStatusClasses()
 	}
 	if trustedProxiesEnvConfigured {
 		cfg.Server.TrustedProxies = normalizeStringSlice(strings.Split(trustedProxiesEnv, ","))
@@ -2444,6 +2791,7 @@ func setDefaults() {
 	viper.SetDefault("pricing.data_dir", "./data")
 	viper.SetDefault("pricing.fallback_file", "./resources/model-pricing/model_prices_and_context_window.json")
 	viper.SetDefault("pricing.override_file", "")
+	viper.SetDefault("pricing.cny_override_file", "")
 	viper.SetDefault("pricing.update_interval_hours", 24)
 	viper.SetDefault("pricing.hash_check_interval_minutes", 10)
 
@@ -2529,6 +2877,66 @@ func setDefaults() {
 	viper.SetDefault("gateway.max_account_switches", 10)
 	viper.SetDefault("gateway.max_account_switches_gemini", 3)
 	viper.SetDefault("gateway.max_same_account_retries_gemini", 4)
+
+	// 账号级容灾策略 gateway.failover_policy.*
+	//
+	// 逐键默认值 = 改造前现状行为（implementation.md §1.6「配置兼容基线表」），
+	// 共 **34 个标量键 + status_classes 规则表 = 35 个配置键**（status_classes 不在此处
+	// 注册 SetDefault，见本段末尾说明）。
+	// 唯一例外是按裁决显式登记的默认行为变更：switchable.use_semantic_bytes（B1）
+	// 与 switch_order.clear_sticky_on_account_failure（B2）；terminal.mixed_status_503
+	// （B3）在本阶段保持 false（用户未裁决，零默认行为变更优先）。
+	//
+	// 特别注意 max_selection_retries 默认 0（不是 design §3.1.5 写的 1）：
+	// 1 相对旧行为是第 4 项默认变更，implementation.md §1.3-D1 裁决为「默认 0，
+	// 发布手册建议值 1，灰度观察后再转正」。
+	//
+	// 环境变量形态：`GATEWAY_FAILOVER_POLICY_<路径>`，**没有 SUB2API_ 前缀**
+	// （本仓库未调用 viper.SetEnvPrefix，详见上方配置块注释「值班必读」第 1 条）。
+	// 改任何默认值都必须同步改 config_test.go 的
+	// TestFailoverPolicyDefaultsMatchCurrentBehaviorState 期望表，否则测试会红。
+	viper.SetDefault("gateway.failover_policy.enabled", true)
+	viper.SetDefault("gateway.failover_policy.side_effects_deferred", false)
+	viper.SetDefault("gateway.failover_policy.network_errors.enabled", true)
+	viper.SetDefault("gateway.failover_policy.failover_on_400", false)
+	viper.SetDefault("gateway.failover_policy.compat_400_keywords", []string{
+		"anthropic-beta", "beta feature", "requires beta",
+		"thinking", "thought_signature", "signature",
+		"tool_use", "tool_result", "tools",
+	})
+	viper.SetDefault("gateway.failover_policy.same_account.default_mode", FailoverSameAccountModeInherit)
+	viper.SetDefault("gateway.failover_policy.budget.total_timeout", time.Duration(0))
+	viper.SetDefault("gateway.failover_policy.budget.per_account_timeout", time.Duration(0))
+	viper.SetDefault("gateway.failover_policy.budget.max_total_upstream_attempts", 0)
+	viper.SetDefault("gateway.failover_policy.budget.max_same_account_attempts_total", 0)
+	viper.SetDefault("gateway.failover_policy.budget.min_switch_cost", 2*time.Second)
+	viper.SetDefault("gateway.failover_policy.budget.stop_clock_on_stream", true)
+	viper.SetDefault("gateway.failover_policy.first_output_timeout_seconds", 0)
+	viper.SetDefault("gateway.failover_policy.cooldown.enabled", false)
+	viper.SetDefault("gateway.failover_policy.cooldown.consecutive_failures_threshold", 3)
+	viper.SetDefault("gateway.failover_policy.cooldown.streak_window", 120*time.Second)
+	viper.SetDefault("gateway.failover_policy.cooldown.default_ttl", 60*time.Second)
+	viper.SetDefault("gateway.failover_policy.cooldown.max_ttl", 24*time.Hour)
+	viper.SetDefault("gateway.failover_policy.cooldown.pool_mode_enabled", true)
+	viper.SetDefault("gateway.failover_policy.cooldown.probe_enabled", true)
+	viper.SetDefault("gateway.failover_policy.cooldown.probe_max_attempts", 3)
+	viper.SetDefault("gateway.failover_policy.cooldown.redis_timeout", 500*time.Millisecond)
+	viper.SetDefault("gateway.failover_policy.cooldown.fail_open", true)
+	viper.SetDefault("gateway.failover_policy.cooldown.batch_read_max", 200)
+	viper.SetDefault("gateway.failover_policy.switch_order.record_chain", true)
+	viper.SetDefault("gateway.failover_policy.switch_order.clear_sticky_on_account_failure", true)
+	viper.SetDefault("gateway.failover_policy.max_selection_retries", 0)
+	viper.SetDefault("gateway.failover_policy.switchable.use_semantic_bytes", true)
+	viper.SetDefault("gateway.failover_policy.switchable.treat_keepalive_as_safe", true)
+	viper.SetDefault("gateway.failover_policy.idempotency.require_key_for_side_effecting", false)
+	viper.SetDefault("gateway.failover_policy.idempotency.blocked_tools", []string{})
+	viper.SetDefault("gateway.failover_policy.t3.only_extend", true)
+	viper.SetDefault("gateway.failover_policy.expose_failover_detail", false)
+	viper.SetDefault("gateway.failover_policy.terminal.mixed_status_503", false)
+	viper.SetDefault("gateway.failover_policy.cost_attempts.enabled", false)
+	// status_classes 是 []struct：viper 的环境变量通路无法表达结构化切片
+	// （见 env_reachability_test.go 对「结构化切片 = 仅配置文件」的说明），
+	// 因此不注册 SetDefault，默认规则表在 load() 反序列化之后显式落地。
 	viper.SetDefault("gateway.force_codex_cli", false)
 	viper.SetDefault("gateway.disable_codex_identity_enforcement", false)
 	viper.SetDefault("gateway.disable_codex_originator_normalization", false)
@@ -2811,6 +3219,198 @@ func setEnvReachableDefaults() {
 	viper.SetDefault("dingtalk_connect.sync_corp_email", false)
 	viper.SetDefault("dingtalk_connect.sync_corp_email_attr_key", "")
 	viper.SetDefault("dingtalk_connect.sync_corp_email_attr_name", "")
+}
+
+// validateGatewayFailoverPolicy 校验 gateway.failover_policy（范围口径取
+// design.md §5.1 的「范围」列）。
+//
+// 调用时机：load() 在**应用完全部默认值之后**才调用 Validate()，因此默认值必须
+// 全部通过；与既有 gateway.scheduling.* 的校验风格一致，这里不做零值容忍——
+// 零值只可能来自配置文件显式写了 0/空，属于需要拒绝的错误配置。
+func (c *Config) validateGatewayFailoverPolicy() error {
+	fp := &c.Gateway.FailoverPolicy
+
+	switch mode := strings.TrimSpace(fp.SameAccount.DefaultMode); mode {
+	case FailoverSameAccountModeInherit, FailoverSameAccountModeOff:
+	default:
+		return fmt.Errorf("gateway.failover_policy.same_account.default_mode must be one of: %s/%s",
+			FailoverSameAccountModeInherit, FailoverSameAccountModeOff)
+	}
+
+	if len(fp.Compat400Keywords) > maxFailoverCompat400Keywords {
+		return fmt.Errorf("gateway.failover_policy.compat_400_keywords must contain at most %d entries",
+			maxFailoverCompat400Keywords)
+	}
+
+	// —— 预算层（默认全关 = 现状） ——
+	if fp.Budget.TotalTimeout < 0 || fp.Budget.TotalTimeout > maxFailoverTotalTimeout {
+		return fmt.Errorf("gateway.failover_policy.budget.total_timeout must be between 0-%s",
+			maxFailoverTotalTimeout)
+	}
+	if fp.Budget.PerAccountTimeout < 0 || fp.Budget.PerAccountTimeout > maxFailoverPerAccountTimeout {
+		return fmt.Errorf("gateway.failover_policy.budget.per_account_timeout must be between 0-%s",
+			maxFailoverPerAccountTimeout)
+	}
+	if fp.Budget.TotalTimeout > 0 && fp.Budget.PerAccountTimeout > 0 &&
+		fp.Budget.TotalTimeout < fp.Budget.PerAccountTimeout {
+		return fmt.Errorf("gateway.failover_policy.budget.total_timeout must be >= gateway.failover_policy.budget.per_account_timeout")
+	}
+	if fp.Budget.MaxTotalUpstreamAttempts < 0 || fp.Budget.MaxTotalUpstreamAttempts > maxFailoverBudgetAttempts {
+		return fmt.Errorf("gateway.failover_policy.budget.max_total_upstream_attempts must be between 0-%d",
+			maxFailoverBudgetAttempts)
+	}
+	if fp.Budget.MaxSameAccountAttemptsTotal < 0 || fp.Budget.MaxSameAccountAttemptsTotal > maxFailoverBudgetAttempts {
+		return fmt.Errorf("gateway.failover_policy.budget.max_same_account_attempts_total must be between 0-%d",
+			maxFailoverBudgetAttempts)
+	}
+	if fp.Budget.MinSwitchCost < 0 || fp.Budget.MinSwitchCost > maxFailoverMinSwitchCost {
+		return fmt.Errorf("gateway.failover_policy.budget.min_switch_cost must be between 0-%s",
+			maxFailoverMinSwitchCost)
+	}
+
+	// —— 首语义字节超时：0 = 关闭，否则 30–600 秒 ——
+	if fp.FirstOutputTimeoutSeconds != 0 &&
+		(fp.FirstOutputTimeoutSeconds < minFailoverFirstOutputTimeout ||
+			fp.FirstOutputTimeoutSeconds > maxFailoverFirstOutputTimeout) {
+		return fmt.Errorf("gateway.failover_policy.first_output_timeout_seconds must be 0 or between %d-%d seconds",
+			minFailoverFirstOutputTimeout, maxFailoverFirstOutputTimeout)
+	}
+
+	// —— T2 冷却层 ——
+	cd := &fp.Cooldown
+	if cd.ConsecutiveFailuresThreshold < 1 || cd.ConsecutiveFailuresThreshold > maxFailoverCooldownThreshold {
+		return fmt.Errorf("gateway.failover_policy.cooldown.consecutive_failures_threshold must be between 1-%d",
+			maxFailoverCooldownThreshold)
+	}
+	if cd.StreakWindow < minFailoverStreakWindow || cd.StreakWindow > maxFailoverStreakWindow {
+		return fmt.Errorf("gateway.failover_policy.cooldown.streak_window must be between %s-%s",
+			minFailoverStreakWindow, maxFailoverStreakWindow)
+	}
+	if cd.DefaultTTL < minFailoverDefaultTTL || cd.DefaultTTL > maxFailoverDefaultTTL {
+		return fmt.Errorf("gateway.failover_policy.cooldown.default_ttl must be between %s-%s",
+			minFailoverDefaultTTL, maxFailoverDefaultTTL)
+	}
+	if cd.MaxTTL < minFailoverMaxTTL || cd.MaxTTL > maxFailoverMaxTTL {
+		return fmt.Errorf("gateway.failover_policy.cooldown.max_ttl must be between %s-%s",
+			minFailoverMaxTTL, maxFailoverMaxTTL)
+	}
+	if cd.DefaultTTL > cd.MaxTTL {
+		return fmt.Errorf("gateway.failover_policy.cooldown.default_ttl must be <= gateway.failover_policy.cooldown.max_ttl")
+	}
+	if cd.ProbeMaxAttempts < 1 || cd.ProbeMaxAttempts > maxFailoverProbeAttempts {
+		return fmt.Errorf("gateway.failover_policy.cooldown.probe_max_attempts must be between 1-%d",
+			maxFailoverProbeAttempts)
+	}
+	if cd.RedisTimeout < minFailoverRedisTimeout || cd.RedisTimeout > maxFailoverRedisTimeout {
+		return fmt.Errorf("gateway.failover_policy.cooldown.redis_timeout must be between %s-%s",
+			minFailoverRedisTimeout, maxFailoverRedisTimeout)
+	}
+	if cd.BatchReadMax < 1 || cd.BatchReadMax > maxFailoverBatchReadMax {
+		return fmt.Errorf("gateway.failover_policy.cooldown.batch_read_max must be between 1-%d",
+			maxFailoverBatchReadMax)
+	}
+	if !cd.FailOpen {
+		// 危险配置：Redis 抖动期间若把「不确定」当成「确定不可用」，会把整个账号池
+		// 一次性摘空。design §5.1 明确要求 fail_open 必须为 true，这里拒绝启动。
+		//
+		// 这是本配置块**唯一**会让进程起不来的键（值班最容易踩的坑）：启动阶段
+		// load() 会打印 `validate config error:
+		// gateway.failover_policy.cooldown.fail_open must be true (fail-closed cooldown
+		// is unsafe)` 并退出。想关冷却请改 cooldown.enabled=false，不要动本键。
+		return fmt.Errorf("gateway.failover_policy.cooldown.fail_open must be true (fail-closed cooldown is unsafe)")
+	}
+
+	// —— 选号活锁护栏 ——
+	if fp.MaxSelectionRetries < 0 || fp.MaxSelectionRetries > maxFailoverSelectionRetries {
+		return fmt.Errorf("gateway.failover_policy.max_selection_retries must be between 0-%d",
+			maxFailoverSelectionRetries)
+	}
+
+	return validateFailoverStatusClasses(fp.StatusClasses)
+}
+
+// validateFailoverStatusClasses 校验失败分类规则表的形状（类别名 / 状态码 / 码段 /
+// 建议覆盖）。类别名只校验非空，不锁枚举：类别集合归分类器（T0.4）演进，配置层
+// 只保证「形状合法」。
+func validateFailoverStatusClasses(rules []FailoverStatusClassRuleConfig) error {
+	for i, rule := range rules {
+		if strings.TrimSpace(rule.Class) == "" {
+			return fmt.Errorf("gateway.failover_policy.status_classes[%d].class must not be empty", i)
+		}
+		for _, code := range rule.Codes {
+			if code < failoverStatusCodeMin || code > failoverStatusCodeMax {
+				return fmt.Errorf("gateway.failover_policy.status_classes[%d].codes contains invalid status code %d",
+					i, code)
+			}
+		}
+		for _, raw := range rule.Ranges {
+			if _, _, err := parseFailoverStatusCodeRange(raw); err != nil {
+				return fmt.Errorf("gateway.failover_policy.status_classes[%d].ranges: %w", i, err)
+			}
+		}
+		if rule.Advice == nil {
+			continue
+		}
+		if rule.Advice.SameAccount != nil {
+			mode := strings.TrimSpace(*rule.Advice.SameAccount)
+			switch mode {
+			case FailoverSameAccountModeInherit, FailoverSameAccountModeOff:
+			case "":
+				return fmt.Errorf("gateway.failover_policy.status_classes[%d].advice.same_account must not be empty", i)
+			default:
+				// 也允许「具体次数」写法（非负十进制整数）。
+				n, err := strconv.Atoi(mode)
+				if err != nil || n < 0 {
+					return fmt.Errorf(
+						"gateway.failover_policy.status_classes[%d].advice.same_account must be %s/%s or a non-negative integer",
+						i, FailoverSameAccountModeInherit, FailoverSameAccountModeOff)
+				}
+			}
+		}
+		if rule.Advice.Cooldown != nil && *rule.Advice.Cooldown < 0 {
+			return fmt.Errorf("gateway.failover_policy.status_classes[%d].advice.cooldown must be non-negative", i)
+		}
+		if rule.Advice.Scope != nil {
+			switch scope := strings.TrimSpace(*rule.Advice.Scope); scope {
+			case failoverScopeAccount, failoverScopeProvider, failoverScopeRequest:
+			default:
+				return fmt.Errorf("gateway.failover_policy.status_classes[%d].advice.scope must be one of: %s/%s/%s",
+					i, failoverScopeAccount, failoverScopeProvider, failoverScopeRequest)
+			}
+		}
+		if rule.Advice.CooldownSource != nil {
+			switch source := strings.TrimSpace(*rule.Advice.CooldownSource); source {
+			case failoverCooldownSourceUpstreamReset, failoverCooldownSourceFixed, failoverCooldownSourceNone:
+			default:
+				return fmt.Errorf(
+					"gateway.failover_policy.status_classes[%d].advice.cooldown_source must be one of: %s/%s/%s",
+					i, failoverCooldownSourceUpstreamReset, failoverCooldownSourceFixed, failoverCooldownSourceNone)
+			}
+		}
+	}
+	return nil
+}
+
+// parseFailoverStatusCodeRange 解析 "500-599" 形式的闭区间状态码段。
+func parseFailoverStatusCodeRange(raw string) (int, int, error) {
+	value := strings.TrimSpace(raw)
+	lowText, highText, ok := strings.Cut(value, "-")
+	if !ok {
+		return 0, 0, fmt.Errorf("range %q must be in \"min-max\" form", raw)
+	}
+	low, err := strconv.Atoi(strings.TrimSpace(lowText))
+	if err != nil {
+		return 0, 0, fmt.Errorf("range %q has invalid lower bound", raw)
+	}
+	high, err := strconv.Atoi(strings.TrimSpace(highText))
+	if err != nil {
+		return 0, 0, fmt.Errorf("range %q has invalid upper bound", raw)
+	}
+	if low < failoverStatusCodeMin || high > failoverStatusCodeMax || low > high {
+		return 0, 0, fmt.Errorf("range %q must satisfy %d <= min <= max <= %d",
+			raw, failoverStatusCodeMin, failoverStatusCodeMax)
+	}
+	return low, high, nil
 }
 
 func (c *Config) Validate() error {
@@ -3491,6 +4091,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Gateway.MaxSameAccountRetriesGemini < 0 || c.Gateway.MaxSameAccountRetriesGemini > 10 {
 		return fmt.Errorf("gateway.max_same_account_retries_gemini must be between 0-10")
+	}
+	if err := c.validateGatewayFailoverPolicy(); err != nil {
+		return err
 	}
 	if c.Gateway.OpenAIFirstOutputTimeoutSeconds < 0 || c.Gateway.OpenAIFirstOutputTimeoutSeconds > 600 ||
 		(c.Gateway.OpenAIFirstOutputTimeoutSeconds > 0 && c.Gateway.OpenAIFirstOutputTimeoutSeconds < 30) {

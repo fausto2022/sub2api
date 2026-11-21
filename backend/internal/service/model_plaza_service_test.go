@@ -164,9 +164,11 @@ func TestListPlazaGroups_CompositeAndOrdinaryGroupsDoNotLeakPlatforms(t *testing
 		byName[group.Name] = group
 	}
 	require.Len(t, byName["anthropic-only"].Models, 1)
-	require.Equal(t, []PlazaModel{{
-		Name: "claude-sonnet", Platform: PlatformAnthropic, Pricing: byName["anthropic-only"].Models[0].Pricing,
-	}}, byName["anthropic-only"].Models)
+	// 只比对模型身份与展示单价：折后价/官方价等展示增强字段不参与本用例断言。
+	single := byName["anthropic-only"].Models[0]
+	require.Equal(t, "claude-sonnet", single.Name)
+	require.Equal(t, PlatformAnthropic, single.Platform)
+	require.NotNil(t, single.Pricing)
 	require.Len(t, byName["composite"].Models, 2)
 	require.Equal(t, []string{"claude-sonnet", "gpt-5"}, []string{
 		byName["composite"].Models[0].Name,
@@ -581,4 +583,239 @@ func TestListGroups_TimePricingPassthrough(t *testing.T) {
 	require.InDelta(t, 0.5, m.TimePricing.Periods[0].Multiplier, 1e-12)
 	// 展示单价为标准时段价
 	require.InDelta(t, 0.28e-6, *m.Pricing.InputPrice, 1e-15)
+}
+
+// newPlazaCatalogService 构造一个接入目录价层的广场服务：override 文件由
+// newPeakPricingService 写入，目录正文用 minimalCatalogJSON 作为基础价表。
+// adminAuthoritative=false 时关闭目录价层开关，用于验证回退行为。
+func newPlazaCatalogService(
+	t *testing.T,
+	overrideJSON string,
+	channels []Channel,
+	groups []Group,
+	groupPlatforms map[int64]string,
+	adminAuthoritative *bool,
+) *ModelPlazaService {
+	t.Helper()
+	catalog := newPeakPricingService(t, overrideJSON)
+	built, err := catalog.buildPricingData([]byte(minimalCatalogJSON))
+	require.NoError(t, err)
+	catalog.mu.Lock()
+	catalog.pricingData = built.data
+	catalog.pricingDataSources = built.sources
+	catalog.overrideModels = built.overrideModels
+	catalog.cnyModels = built.cnyModels
+	catalog.peakConfigs = built.peakConfigs
+	catalog.mu.Unlock()
+
+	repo := &mockChannelRepository{
+		listAllFn: func(ctx context.Context) ([]Channel, error) { return channels, nil },
+		getGroupPlatformsFn: func(ctx context.Context, _ []int64) (map[int64]string, error) {
+			return groupPlatforms, nil
+		},
+	}
+	cs := NewChannelService(repo, nil, nil, nil, nil)
+	bs := NewBillingService(&config.Config{}, catalog)
+	resolver := NewModelPricingResolver(cs, bs)
+	admin := NewModelPricingAdminService(catalog.cfg, catalog)
+	admin.SetCatalogPricingResolver(resolver)
+	if adminAuthoritative != nil {
+		admin.SetCatalogPricingAuthoritative(*adminAuthoritative)
+	}
+	return NewModelPlazaService(repo, &stubGroupRepoForAvailable{activeGroups: groups}, catalog, bs, resolver)
+}
+
+// catalogPlazaChannels 造一个挂两分组的渠道，模型在渠道定价上也有价，
+// 用于验证「目录价优先于渠道/分组价」。
+func catalogPlazaChannels(platform, model string, groupIDs []int64) []Channel {
+	return []Channel{{
+		ID: 1, Name: "catalog-ch", Status: StatusActive, GroupIDs: groupIDs,
+		ModelPricing: []ChannelModelPricing{{
+			Platform: platform, Models: []string{model}, BillingMode: BillingModeToken,
+			// 渠道价刻意与目录价不同（更贵），用来区分数据来源。
+			InputPrice: testPtrFloat64(9e-6), OutputPrice: testPtrFloat64(9e-5),
+		}},
+	}}
+}
+
+// TestListGroups_CatalogPricingTakesPrecedence 覆盖 A10/§3.4：目录价层接管时，
+// 广场的 pricing 与 catalog_pricing 都取目录价，而不是渠道/分组价。
+func TestListPlazaGroups_CatalogPricingTakesPrecedence(t *testing.T) {
+	groups := []Group{{ID: 10, Name: "g", Platform: PlatformAnthropic, RateMultiplier: 1}}
+	svc := newPlazaCatalogService(t, `{
+		"claude-sonnet-4": {
+			"input_cost_per_token": 1e-06,
+			"output_cost_per_token": 5e-06,
+			"_catalog": {"platform": "anthropic", "custom": true}
+		}
+	}`, catalogPlazaChannels(PlatformAnthropic, "claude-sonnet-4", []int64{10}),
+		groups, map[int64]string{10: PlatformAnthropic}, nil)
+
+	out, err := svc.ListGroups(context.Background())
+	require.NoError(t, err)
+	require.Len(t, out, 1)
+	require.Equal(t, 1, out[0].CatalogModelCount, "目录价接管应计入分组统计")
+	m := out[0].Models[0]
+
+	require.NotNil(t, m.CatalogPricing, "目录价层接管时必须给出 catalog_pricing")
+	require.InDelta(t, 1e-6, *m.CatalogPricing.InputPrice, 1e-12)
+	require.InDelta(t, 5e-6, *m.CatalogPricing.OutputPrice, 1e-12)
+	// 展示单价同样取目录价（与计费同源），不是渠道的 9e-6。
+	require.NotNil(t, m.Pricing)
+	require.InDelta(t, 1e-6, *m.Pricing.InputPrice, 1e-12)
+	require.InDelta(t, 5e-6, *m.Pricing.OutputPrice, 1e-12)
+}
+
+// TestListGroups_DiscountedPricingIsCatalogTimesGroupRate 覆盖 §4.3：
+// 折后价 = 目录价 × 分组倍率。
+func TestListPlazaGroups_DiscountedPricingIsCatalogTimesGroupRate(t *testing.T) {
+	groups := []Group{{ID: 10, Name: "g", Platform: PlatformAnthropic, RateMultiplier: 0.8}}
+	svc := newPlazaCatalogService(t, `{
+		"claude-sonnet-4": {
+			"input_cost_per_token": 4e-06,
+			"output_cost_per_token": 1.6e-05,
+			"_catalog": {"platform": "anthropic", "custom": true}
+		}
+	}`, catalogPlazaChannels(PlatformAnthropic, "claude-sonnet-4", []int64{10}),
+		groups, map[int64]string{10: PlatformAnthropic}, nil)
+
+	out, err := svc.ListGroups(context.Background())
+	require.NoError(t, err)
+	m := out[0].Models[0]
+
+	require.NotNil(t, m.DiscountedPricing)
+	require.InDelta(t, 4e-6*0.8, *m.DiscountedPricing.InputPrice, 1e-15)
+	require.InDelta(t, 1.6e-5*0.8, *m.DiscountedPricing.OutputPrice, 1e-15)
+	// 原始目录价不受折后计算影响（前端要同时展示两列）。
+	require.InDelta(t, 4e-6, *m.CatalogPricing.InputPrice, 1e-15)
+}
+
+// TestListGroups_DifferentGroupRatesYieldDifferentDiscountedPricing 覆盖 A11：
+// 同一模型挂在两个不同倍率的分组下，折后价必须不同且各自等于目录价 × 该组倍率。
+func TestListPlazaGroups_DifferentGroupRatesYieldDifferentDiscountedPricing(t *testing.T) {
+	groups := []Group{
+		{ID: 10, Name: "standard", Platform: PlatformAnthropic, RateMultiplier: 1},
+		{ID: 20, Name: "vip", Platform: PlatformAnthropic, RateMultiplier: 0.5},
+	}
+	svc := newPlazaCatalogService(t, `{
+		"claude-sonnet-4": {
+			"input_cost_per_token": 4e-06,
+			"output_cost_per_token": 1.6e-05,
+			"_catalog": {"platform": "anthropic", "custom": true}
+		}
+	}`, catalogPlazaChannels(PlatformAnthropic, "claude-sonnet-4", []int64{10, 20}),
+		groups, map[int64]string{10: PlatformAnthropic, 20: PlatformAnthropic}, nil)
+
+	out, err := svc.ListGroups(context.Background())
+	require.NoError(t, err)
+	require.Len(t, out, 2)
+	byName := make(map[string]PlazaGroup, len(out))
+	for _, g := range out {
+		byName[g.Name] = g
+	}
+
+	standard := byName["standard"].Models[0]
+	vip := byName["vip"].Models[0]
+	require.InDelta(t, 4e-6, *standard.DiscountedPricing.InputPrice, 1e-15)
+	require.InDelta(t, 2e-6, *vip.DiscountedPricing.InputPrice, 1e-15)
+	require.NotEqual(t, *standard.DiscountedPricing.InputPrice, *vip.DiscountedPricing.InputPrice,
+		"不同分组倍率下折后价必须不同")
+	// 目录价本身与分组无关。
+	require.InDelta(t, *standard.CatalogPricing.InputPrice, *vip.CatalogPricing.InputPrice, 1e-15)
+}
+
+// TestListGroups_CatalogPeakPricingExposed 覆盖 PlazaModel.PeakPricing：
+// `_catalog.peak` 配置的高峰价按 peak 原样给出，不影响目录基础价。
+func TestListPlazaGroups_CatalogPeakPricingExposed(t *testing.T) {
+	groups := []Group{{ID: 10, Name: "g", Platform: PlatformDeepseek, RateMultiplier: 1}}
+	svc := newPlazaCatalogService(t, `{
+		"deepseek-v4-flash": {
+			"input_cost_per_token": 3e-07,
+			"output_cost_per_token": 1.2e-06,
+			"_catalog": {
+				"platform": "deepseek",
+				"custom": true,
+				"peak_enabled": true,
+				"peak": {"input_cost_per_token": 6e-07, "output_cost_per_token": 2.4e-06},
+				"off_peak": {"input_cost_per_token": 3e-07, "output_cost_per_token": 1.2e-06}
+			}
+		}
+	}`, catalogPlazaChannels(PlatformDeepseek, "deepseek-v4-flash", []int64{10}),
+		groups, map[int64]string{10: PlatformDeepseek}, nil)
+
+	out, err := svc.ListGroups(context.Background())
+	require.NoError(t, err)
+	m := out[0].Models[0]
+
+	require.NotNil(t, m.PeakPricing, "启用自定义峰谷时应给出峰价")
+	require.InDelta(t, 6e-7, *m.PeakPricing.InputPrice, 1e-15)
+	require.InDelta(t, 2.4e-6, *m.PeakPricing.OutputPrice, 1e-15)
+	// 基础目录价保持低谷价。
+	require.InDelta(t, 3e-7, *m.CatalogPricing.InputPrice, 1e-15)
+}
+
+// TestListGroups_CatalogDisabledFallsBackToChannelPricing 覆盖 A9：
+// catalog_pricing_authoritative=false 时不接管，广场回到渠道价且无 catalog 数据。
+func TestListPlazaGroups_CatalogDisabledFallsBackToChannelPricing(t *testing.T) {
+	disabled := false
+	groups := []Group{{ID: 10, Name: "g", Platform: PlatformAnthropic, RateMultiplier: 1}}
+	svc := newPlazaCatalogService(t, `{
+		"claude-sonnet-4": {
+			"input_cost_per_token": 1e-06,
+			"_catalog": {"platform": "anthropic", "custom": true}
+		}
+	}`, catalogPlazaChannels(PlatformAnthropic, "claude-sonnet-4", []int64{10}),
+		groups, map[int64]string{10: PlatformAnthropic}, &disabled)
+
+	out, err := svc.ListGroups(context.Background())
+	require.NoError(t, err)
+	m := out[0].Models[0]
+
+	require.Nil(t, m.CatalogPricing, "开关关闭时不得接管目录价")
+	require.Zero(t, out[0].CatalogModelCount)
+	require.NotNil(t, m.Pricing)
+	require.InDelta(t, 9e-6, *m.Pricing.InputPrice, 1e-15, "回退到渠道定价")
+}
+
+// TestPlazaGroupEffectiveRate_MediaIndependentRates 覆盖倍率口径：
+// 图片/视频独立倍率开启时取独立倍率，否则用户专属倍率优先于分组默认倍率。
+func TestPlazaGroupEffectiveRate_MediaIndependentRates(t *testing.T) {
+	group := &PlazaGroup{
+		RateMultiplier: 1.2, IsExclusive: false,
+		ImageRateIndependent: true, ImageRateMultiplier: 1,
+		VideoRateIndependent: true, VideoRateMultiplier: 0.7,
+	}
+	userRate := 0.5
+
+	require.InDelta(t, 1.0, PlazaGroupEffectiveRate(group, BillingModeImage, &userRate), 1e-12,
+		"图片独立倍率开启时不取分组/专属倍率")
+	require.InDelta(t, 0.7, PlazaGroupEffectiveRate(group, BillingModeVideo, &userRate), 1e-12,
+		"视频独立倍率开启时不取分组/专属倍率")
+	require.InDelta(t, 0.5, PlazaGroupEffectiveRate(group, BillingModeToken, &userRate), 1e-12,
+		"token 模型用户专属倍率优先")
+	require.InDelta(t, 1.2, PlazaGroupEffectiveRate(group, BillingModeToken, nil), 1e-12,
+		"无专属倍率时回落分组默认倍率")
+}
+
+// TestPlazaDiscountedPricing_ScalesEveryTier 覆盖折后价对阶梯逐档折算。
+func TestPlazaDiscountedPricing_ScalesEveryTier(t *testing.T) {
+	maxTokens := 272000
+	pricing := &ChannelModelPricing{
+		BillingMode: BillingModeToken,
+		InputPrice:  testPtrFloat64(2e-6),
+		Intervals: []PricingInterval{
+			{MinTokens: 0, MaxTokens: &maxTokens, TierLabel: "≤272K", InputPrice: testPtrFloat64(2e-6)},
+			{MinTokens: 272000, TierLabel: ">272K", InputPrice: testPtrFloat64(4e-6)},
+		},
+	}
+
+	out := PlazaDiscountedPricing(pricing, 0.5)
+	require.NotNil(t, out)
+	require.InDelta(t, 1e-6, *out.InputPrice, 1e-15)
+	require.Len(t, out.Intervals, 2)
+	require.InDelta(t, 1e-6, *out.Intervals[0].InputPrice, 1e-15)
+	require.InDelta(t, 2e-6, *out.Intervals[1].InputPrice, 1e-15)
+	// 入参不被修改。
+	require.InDelta(t, 2e-6, *pricing.InputPrice, 1e-15)
+	require.Nil(t, PlazaDiscountedPricing(nil, 0.5))
 }

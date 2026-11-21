@@ -27,6 +27,18 @@
               class="w-40"
               @change="loadChannels"
             />
+
+            <!-- 来源筛选（运营管理 / 手工创建）：后端无该查询参数，按行来源在客户端过滤 -->
+            <select
+              v-model="filters.source"
+              class="input w-40"
+              :aria-label="t('admin.opsmgmt.source.filterLabel')"
+              data-testid="channels-source-filter"
+            >
+              <option value="">{{ t('admin.opsmgmt.source.filterAll') }}</option>
+              <option value="manual">{{ t('admin.opsmgmt.source.manual') }}</option>
+              <option value="opsmgmt">{{ t('admin.opsmgmt.source.opsmgmt') }}</option>
+            </select>
           </div>
 
           <!-- Right: Actions -->
@@ -50,7 +62,7 @@
       <template #table>
         <DataTable
           :columns="columns"
-          :data="channels"
+          :data="displayedChannels"
           :loading="loading"
           :server-side-sort="true"
           default-sort-key="created_at"
@@ -59,6 +71,18 @@
         >
           <template #cell-name="{ value }">
             <span class="font-medium text-gray-900 dark:text-white">{{ value }}</span>
+          </template>
+
+          <template #cell-source="{ row }">
+            <SourceBadge
+              :kind="channelSource(row).kind"
+              :site-name="channelSource(row).siteName || ''"
+              :site-id="channelSource(row).siteId ?? null"
+              :remote-group-id="channelSource(row).remoteGroupId ?? null"
+              :auto-disabled-reason="channelSource(row).autoDisabledReason || ''"
+              :auto-disabled-at="channelSource(row).autoDisabledAt ?? null"
+              :test-id="`channel-source-${row.id}`"
+            />
           </template>
 
           <template #cell-description="{ value }">
@@ -652,6 +676,16 @@ import Icon from '@/components/icons/Icon.vue'
 import PlatformIcon from '@/components/common/PlatformIcon.vue'
 import Toggle from '@/components/common/Toggle.vue'
 import PricingEntryCard from '@/components/admin/channel/PricingEntryCard.vue'
+import SourceBadge from '@/components/opsmgmt/SourceBadge.vue'
+import {
+  buildOpsSourceIndex,
+  emptySourceIndex,
+  filterBySource,
+  resolveChannelSource,
+  type OpsChannelSource,
+  type OpsSourceIndex
+} from '@/components/opsmgmt/source'
+import { opsMgmtAPI } from '@/api/admin/opsmgmt'
 import { getPersistedPageSize } from '@/composables/usePersistedPageSize'
 import { useKeyedDebouncedSearch } from '@/composables/useKeyedDebouncedSearch'
 
@@ -709,6 +743,8 @@ interface PlatformSection {
 // ── Table columns ──
 const columns = computed<Column[]>(() => [
   { key: 'name', label: t('admin.channels.columns.name', 'Name'), sortable: true },
+  // 来源：运营管理（⬢ + 站点名）或手工创建；后端无该列，按运营标签在客户端装配。
+  { key: 'source', label: t('admin.opsmgmt.source.column'), sortable: false },
   { key: 'description', label: t('admin.channels.columns.description', 'Description'), sortable: false },
   { key: 'status', label: t('admin.channels.columns.status', 'Status'), sortable: true },
   { key: 'group_count', label: t('admin.channels.columns.groups', 'Groups'), sortable: false },
@@ -739,7 +775,9 @@ const billingModelSourceOptions = computed(() => [
 const channels = ref<Channel[]>([])
 const loading = ref(false)
 const searchQuery = ref('')
-const filters = reactive({ status: '' })
+const filters = reactive({ status: '', source: '' as '' | 'opsmgmt' | 'manual' })
+/** 运营管理标签索引（自动停用列表 + 任务 + 守护锁 + 站点名），用于「来源」列。 */
+const opsSourceIndex = ref<OpsSourceIndex>(emptySourceIndex())
 const pagination = reactive({
   page: 1,
   page_size: getPersistedPageSize(),
@@ -749,6 +787,40 @@ const sortState = reactive({
   sort_by: 'created_at',
   sort_order: 'desc' as 'asc' | 'desc'
 })
+
+/** 单行渠道的来源（运营管理 / 手工创建）。 */
+function channelSource(channel: Channel): OpsChannelSource {
+  return resolveChannelSource({ id: channel.id, group_ids: channel.group_ids }, opsSourceIndex.value)
+}
+
+/**
+ * 「来源」筛选是客户端过滤（后端 /admin/channels 无 source 参数）：
+ * 只作用于当前页的行，total 仍是服务端总数，避免误导为「全局匹配数」。
+ */
+const displayedChannels = computed(() =>
+  filterBySource(channels.value, filters.source, (channel) => channelSource(channel))
+)
+
+/** 装配运营来源索引：任一路接口失败都不影响渠道列表本身。 */
+async function loadOpsSourceIndex() {
+  try {
+    const [sites, autoDisabled, tasks, guardLocks] = await Promise.all([
+      opsMgmtAPI.listSites().catch(() => ({ items: [], total: 0 })),
+      opsMgmtAPI.listAutoDisabledChannels().catch(() => ({ items: [], total: 0 })),
+      opsMgmtAPI.listTasks(50).catch(() => ({ items: [], total: 0 })),
+      opsMgmtAPI.listGuardLocks().catch(() => ({ items: [], total: 0 }))
+    ])
+    opsSourceIndex.value = buildOpsSourceIndex({
+      sites: sites.items,
+      autoDisabled: autoDisabled.items,
+      tasks: tasks.items,
+      guardLocks: guardLocks.items
+    })
+  } catch {
+    // 运营管理接口不可用时退回「手工创建」，不阻塞渠道管理页。
+    opsSourceIndex.value = emptySourceIndex()
+  }
+}
 
 // Dialog state
 const showDialog = ref(false)
@@ -1709,6 +1781,7 @@ onMounted(() => {
   loadChannels()
   loadGroups()
   loadWebSearchGlobalState()
+  loadOpsSourceIndex()
   document.addEventListener('click', handleRuleAccountClickOutside)
 })
 

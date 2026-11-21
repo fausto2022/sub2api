@@ -33,6 +33,8 @@ const (
 	NotificationEmailEventCyberPolicyNotice           = "content_moderation.cyber_policy_notice"
 	NotificationEmailEventOpsAlert                    = "ops.alert"
 	NotificationEmailEventOpsScheduledReport          = "ops.scheduled_report"
+	// NotificationEmailEventTicketReply 是工单管理员回复的用户通知（事务性邮件，不可退订）。
+	NotificationEmailEventTicketReply = "ticket.reply"
 
 	notificationEmailTemplateKeyPrefix    = "notification_email_template:"
 	notificationEmailPreferenceKeyPrefix  = "notification_email_preference:"
@@ -557,6 +559,18 @@ func (s *NotificationEmailService) runtimeVariables(ctx context.Context, event, 
 			}
 		}
 	}
+	if event == NotificationEmailEventTicketReply {
+		// 工单通知的变量必须来自调用方，避免预览样本值进入真实邮件。
+		ticketID := strings.TrimSpace(input.Variables["ticket_id"])
+		variables["ticket_subject"] = input.Variables["ticket_subject"]
+		variables["reply_content"] = input.Variables["reply_content"]
+		variables["ticket_id"] = ticketID
+		ticketURL := strings.TrimSpace(input.Variables["ticket_url"])
+		if ticketURL == "" && ticketID != "" {
+			ticketURL = s.baseURL(ctx) + "/tickets/" + ticketID
+		}
+		variables["ticket_url"] = ticketURL
+	}
 	variables["site_name"] = s.siteName(ctx)
 	variables["recipient_email"] = input.RecipientEmail
 	if strings.TrimSpace(input.RecipientName) != "" {
@@ -941,6 +955,10 @@ func notificationEmailSampleVariables(locale string) map[string]string {
 			"report_start_time":   "2026-07-18T01:00:26Z",
 			"report_end_time":     "2026-07-19T01:00:26Z",
 			"report_html":         "<h2>日报</h2><p>请求量：2,374</p>",
+			"ticket_subject":      "无法调用 API",
+			"ticket_id":           "1024",
+			"reply_content":       "您好，问题已定位并修复，请重试。",
+			"ticket_url":          "https://example.com/tickets/1024",
 		}
 		addNotificationEmailOpsSummarySampleVariables(variables)
 		return variables
@@ -989,6 +1007,10 @@ func notificationEmailSampleVariables(locale string) map[string]string {
 		"report_start_time":   "2026-07-18T01:00:26Z",
 		"report_end_time":     "2026-07-19T01:00:26Z",
 		"report_html":         "<h2>Daily summary</h2><p>Requests: 2,374</p>",
+		"ticket_subject":      "Cannot call the API",
+		"ticket_id":           "1024",
+		"reply_content":       "The issue has been located and fixed, please try again.",
+		"ticket_url":          "https://example.com/tickets/1024",
 	}
 	addNotificationEmailOpsSummarySampleVariables(variables)
 	return variables
@@ -1034,6 +1056,7 @@ var notificationEmailEventOrder = []string{
 	NotificationEmailEventCyberPolicyNotice,
 	NotificationEmailEventOpsAlert,
 	NotificationEmailEventOpsScheduledReport,
+	NotificationEmailEventTicketReply,
 }
 
 var notificationEmailEventDefinitions = map[string]NotificationEmailEventInfo{
@@ -1151,6 +1174,15 @@ var notificationEmailEventDefinitions = map[string]NotificationEmailEventInfo{
 			),
 			append(append([]string{}, notificationEmailOpsSummaryPlaceholders...), "report_detail_display", "report_html")...,
 		),
+	},
+	NotificationEmailEventTicketReply: {
+		Event:       NotificationEmailEventTicketReply,
+		Label:       "Ticket reply",
+		Description: "Sent to the ticket submitter when a support agent replies to their ticket.",
+		Category:    "support",
+		Optional:    false,
+		Placeholders: append(append([]string{}, notificationEmailCommonPlaceholders...),
+			"ticket_subject", "ticket_id", "reply_content", "ticket_url"),
 	},
 }
 
@@ -1434,6 +1466,30 @@ var notificationEmailOfficialTemplates = map[string]map[string]notificationEmail
 		notificationEmailLocaleChinese: {
 			Subject: "[运维报表] {{report_name}}",
 			HTML:    notificationEmailOpsScheduledReportTemplate(notificationEmailLocaleChinese),
+		},
+	},
+	NotificationEmailEventTicketReply: {
+		notificationEmailDefaultLocale: {
+			Subject: "[{{site_name}}] New reply to ticket #{{ticket_id}}",
+			HTML: notificationEmailCard("#4f46e5", "New reply to your ticket", `
+<p>Hello {{recipient_name}},</p>
+<p>A support agent has replied to your ticket <strong>{{ticket_subject}}</strong> (#{{ticket_id}}).</p>
+<table style="width:100%;border-collapse:collapse;">
+  <tr><td style="vertical-align:top;">Reply</td><td>{{reply_content}}</td></tr>
+</table>
+<p><a class="button" href="{{ticket_url}}">View ticket</a></p>
+<p class="muted">If the button does not work, copy this link into your browser:<br>{{ticket_url}}</p>`),
+		},
+		notificationEmailLocaleChinese: {
+			Subject: "[{{site_name}}] 工单 #{{ticket_id}} 有新回复",
+			HTML: notificationEmailCard("#4f46e5", "您的工单有新回复", `
+<p>{{recipient_name}}，您好：</p>
+<p>客服已回复您的工单 <strong>{{ticket_subject}}</strong>（#{{ticket_id}}）。</p>
+<table style="width:100%;border-collapse:collapse;">
+  <tr><td style="vertical-align:top;">回复内容</td><td>{{reply_content}}</td></tr>
+</table>
+<p><a class="button" href="{{ticket_url}}">查看工单</a></p>
+<p class="muted">如果按钮无法点击，请复制以下链接到浏览器中打开：<br>{{ticket_url}}</p>`),
 		},
 	},
 }

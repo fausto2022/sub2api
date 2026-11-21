@@ -11,6 +11,17 @@
             @change="debouncedReload"
             @update:searchQuery="debouncedReload"
           />
+          <!-- 来源筛选（运营管理 / 手工创建）：客户端按运营标签过滤当前页 -->
+          <select
+            v-model="sourceFilter"
+            class="input w-40"
+            :aria-label="t('admin.opsmgmt.source.filterLabel')"
+            data-testid="accounts-source-filter"
+          >
+            <option value="">{{ t('admin.opsmgmt.source.filterAll') }}</option>
+            <option value="manual">{{ t('admin.opsmgmt.source.manual') }}</option>
+            <option value="opsmgmt">{{ t('admin.opsmgmt.source.opsmgmt') }}</option>
+          </select>
           <AccountTableActions
             :loading="loading"
             @refresh="handleManualRefresh"
@@ -195,7 +206,7 @@
         <DataTable
           ref="dataTableRef"
           :columns="cols"
-          :data="accounts"
+          :data="displayAccounts"
           :loading="loading && accounts.length === 0"
           row-key="id"
           :server-side-sort="true"
@@ -285,6 +296,17 @@
           </template>
           <template #cell-capacity="{ row }">
             <AccountCapacityCell :account="row" />
+          </template>
+          <template #cell-source="{ row }">
+            <SourceBadge
+              :kind="accountSource(row).kind"
+              :site-name="accountSource(row).siteName || ''"
+              :site-id="accountSource(row).siteId ?? null"
+              :remote-group-id="accountSource(row).remoteGroupId ?? null"
+              :auto-disabled-reason="accountSource(row).autoDisabledReason || ''"
+              :auto-disabled-at="accountSource(row).autoDisabledAt ?? null"
+              :test-id="`account-source-${row.id}`"
+            />
           </template>
           <template #cell-status="{ row }">
             <div class="flex items-center gap-1.5">
@@ -528,6 +550,16 @@ import UpstreamBillingRateCell from '@/components/account/UpstreamBillingRateCel
 import AccountPriorityCell from '@/components/account/AccountPriorityCell.vue'
 import PlatformTypeBadge from '@/components/common/PlatformTypeBadge.vue'
 import Icon from '@/components/icons/Icon.vue'
+import SourceBadge from '@/components/opsmgmt/SourceBadge.vue'
+import {
+  buildOpsSourceIndex,
+  emptySourceIndex,
+  filterBySource,
+  resolveAccountSource,
+  type OpsChannelSource,
+  type OpsSourceIndex
+} from '@/components/opsmgmt/source'
+import { opsMgmtAPI } from '@/api/admin/opsmgmt'
 import ErrorPassthroughRulesModal from '@/components/admin/ErrorPassthroughRulesModal.vue'
 import TLSFingerprintProfilesModal from '@/components/admin/TLSFingerprintProfilesModal.vue'
 import { fetchAllAccountIds } from '@/utils/accountSelection'
@@ -1121,6 +1153,41 @@ const {
     sort_order: sortState.sort_order
   }
 })
+
+// ── 来源（运营管理 / 手工创建）──
+// 账号本身没有运营标签列：控制对象是本地 Channel（design §2.6），因此来源按
+// 「账号所属分组是否被运营管理渠道覆盖」推断；索引由自动停用列表 + 任务 +
+// 守护锁 + 站点名装配，任一接口不可用时整体退回「手工创建」。
+const opsSourceIndex = ref<OpsSourceIndex>(emptySourceIndex())
+const sourceFilter = ref<'' | 'opsmgmt' | 'manual'>('')
+
+function accountSource(account: AccountListItem): OpsChannelSource {
+  return resolveAccountSource({ group_ids: account.group_ids }, opsSourceIndex.value)
+}
+
+/** 来源筛选为客户端过滤（后端 /admin/accounts 无 source 参数），只作用于当前页。 */
+const displayAccounts = computed(() =>
+  filterBySource(accounts.value, sourceFilter.value, (account) => accountSource(account))
+)
+
+async function loadOpsSourceIndex(): Promise<void> {
+  try {
+    const [sites, autoDisabled, tasks, guardLocks] = await Promise.all([
+      opsMgmtAPI.listSites().catch(() => ({ items: [], total: 0 })),
+      opsMgmtAPI.listAutoDisabledChannels().catch(() => ({ items: [], total: 0 })),
+      opsMgmtAPI.listTasks(50).catch(() => ({ items: [], total: 0 })),
+      opsMgmtAPI.listGuardLocks().catch(() => ({ items: [], total: 0 }))
+    ])
+    opsSourceIndex.value = buildOpsSourceIndex({
+      sites: sites.items,
+      autoDisabled: autoDisabled.items,
+      tasks: tasks.items,
+      guardLocks: guardLocks.items
+    })
+  } catch {
+    opsSourceIndex.value = emptySourceIndex()
+  }
+}
 
 const {
   selectedSet,
@@ -1827,6 +1894,8 @@ const allColumns = computed(() => {
     { key: 'name', label: t('admin.accounts.columns.name'), sortable: true },
     { key: 'id', label: t('admin.accounts.columns.id'), sortable: true },
     { key: 'platform_type', label: t('admin.accounts.columns.platformType'), sortable: false },
+    // 来源：运营管理（⬢ + 站点名）/ 手工创建。
+    { key: 'source', label: t('admin.opsmgmt.source.column'), sortable: false },
     { key: 'capacity', label: t('admin.accounts.columns.capacity'), sortable: false },
     { key: 'status', label: t('admin.accounts.columns.status'), sortable: true },
     { key: 'schedulable', label: t('admin.accounts.columns.schedulable'), sortable: true },
@@ -2576,6 +2645,7 @@ onMounted(async () => {
 
   load()
   loadUpstreamBillingProbeGlobalState()
+  loadOpsSourceIndex()
   const [proxiesResult, groupsResult] = await Promise.allSettled([
     adminAPI.proxies.getAll(),
     adminAPI.groups.getAll()

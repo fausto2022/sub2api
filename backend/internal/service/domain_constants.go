@@ -545,12 +545,15 @@ const (
 
 	// SettingKeyModelPlazaEnabled is a DB-backed soft switch for the Model Plaza page
 	// (public group/model pricing showcase). When false: the plaza endpoint returns 404
-	// and the header entry is hidden. Defaults to false (opt-in feature).
+	// and the header entry is hidden. Defaults to true (opt-out feature): the plaza is the
+	// public price list, so a fresh deployment exposes it unless an operator turns it off.
+	// Parsing must go through modelPlazaEnabledFromSetting so that "unset" means enabled
+	// while an explicit false/0/off/disabled still disables it.
 	SettingKeyModelPlazaEnabled = "model_plaza_enabled"
 
 	// SettingKeyModelPlazaRequireAuth controls whether the Model Plaza page requires a
 	// logged-in user. When false the page is public and anonymous visitors see only
-	// non-exclusive groups.
+	// non-exclusive groups. Defaults to false (public).
 	SettingKeyModelPlazaRequireAuth = "model_plaza_require_auth"
 
 	// SettingKeyModelPlazaDescription stores the Markdown blurb rendered at the top of
@@ -560,7 +563,6 @@ const (
 	// SettingKeyPluginManagementEnabled controls sidebar visibility only; it does
 	// not stop or otherwise change already loaded plugin runtimes.
 	SettingKeyPluginManagementEnabled = "plugin_management_enabled"
-
 	// SettingKeyUpstreamBillingProbeSettings stores the global enable switch and interval
 	// for probing remote Sub2API API-key billing metadata.
 	SettingKeyUpstreamBillingProbeSettings = "upstream_billing_probe_settings"

@@ -44,13 +44,57 @@ func (s *GatewayService) shouldRetryUpstreamError(account *Account, statusCode i
 }
 
 // shouldFailoverUpstreamError determines whether an upstream error should trigger account failover.
+//
+// P1/T1.1：判定已收敛到 ClassifyUpstreamFailure（failover_classifier.go），本函数不再持有
+// 状态码集合，只声明网关族（Anthropic/Bedrock 与 Antigravity、Gemini 共用同一套旧语义）。
+// 等价性由 failover_legacy_equivalence_test.go 的全状态码双跑锁定。
 func (s *GatewayService) shouldFailoverUpstreamError(statusCode int) bool {
-	switch statusCode {
-	case 401, 403, 429, 529:
-		return true
-	default:
-		return statusCode >= 500
+	return shouldFailoverStatus(statusCode, FailoverProfileAnthropic)
+}
+
+func (s *GatewayService) shouldFailoverForRequest(ctx context.Context, status int) bool {
+	legacy := s.shouldFailoverUpstreamError(status)
+	policy, _ := ResolvedGatewayFailoverPolicy(ctx)
+	if !legacy || policy.Legacy() || status < failoverStatusMin || status > failoverStatusMax {
+		return legacy
 	}
+	_, advice := ClassifyUpstreamFailure(ClassifyInput{StatusCode: status, Profile: FailoverProfileAnthropic, Policy: policy})
+	return advice.Failover
+}
+
+func (s *GatewayService) failover400EnabledForRequest(ctx context.Context) bool {
+	if policy, _ := ResolvedGatewayFailoverPolicy(ctx); !policy.Legacy() && policy.FailoverOn400 != nil {
+		return *policy.FailoverOn400
+	}
+	return s.cfg != nil && s.cfg.Gateway.FailoverOn400
+}
+
+func (s *GatewayService) matchesFailover400ForRequest(ctx context.Context, body []byte) bool {
+	if policy, _ := ResolvedGatewayFailoverPolicy(ctx); !policy.Legacy() {
+		return matchesCompat400Keywords(body, compat400Keywords(policy))
+	}
+	return s.shouldFailoverOn400(body)
+}
+
+// failoverStatusMin/Max 是 HTTP 状态码的定义域（与 config.validateGatewayFailoverPolicy 同范围）。
+const (
+	failoverStatusMin = 100
+	failoverStatusMax = 599
+)
+
+// shouldFailoverStatus 是 P1 之后唯一的「状态码 → 是否换号」入口，被 4 个网关族的
+// 旧硬编码函数共同调用（gateway_forward / antigravity / gemini / openai）。
+//
+// 定义域外的状态码（<100 或 >599，生产路径不会出现）沿用改造前四处共同的
+// `statusCode >= 500` 兜底，从而与旧实现**逐值**等价：分类器的规则表只覆盖 100–599，
+// 直接把 600 喂给分类器会命中兜底的 request_invalid（不换号），与旧语义相反。
+// 这条边界由 failover_legacy_equivalence_test.go 的 -1..700 全量双跑锁定。
+func shouldFailoverStatus(statusCode int, profile FailoverProfile) bool {
+	if statusCode < failoverStatusMin || statusCode > failoverStatusMax {
+		return statusCode >= http.StatusInternalServerError
+	}
+	_, advice := ClassifyUpstreamFailure(ClassifyInput{StatusCode: statusCode, Profile: profile})
+	return advice.Failover
 }
 
 func retryBackoffDelay(attempt int) time.Duration {
@@ -399,7 +443,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 		lastWireBody = wireBody
 
 		// 发送请求
-		resp, err = s.httpUpstream.DoWithTLS(upstreamReq, proxyURL, account.ID, account.Concurrency, tlsProfile)
+		resp, err = (failoverAttemptUpstream{s.httpUpstream}).DoWithTLS(upstreamReq, proxyURL, account.ID, account.Concurrency, tlsProfile)
 		if err != nil {
 			if resp != nil && resp.Body != nil {
 				_ = resp.Body.Close()
@@ -462,7 +506,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 					retryReq, retryWireBody, buildErr := s.buildUpstreamRequest(retryCtx, c, account, filteredBody, token, tokenType, reqModel, reqStream, shouldMimicClaudeCode)
 					releaseRetryCtx()
 					if buildErr == nil {
-						retryResp, retryErr := s.httpUpstream.DoWithTLS(retryReq, proxyURL, account.ID, account.Concurrency, tlsProfile)
+						retryResp, retryErr := (failoverAttemptUpstream{s.httpUpstream}).DoWithTLS(retryReq, proxyURL, account.ID, account.Concurrency, tlsProfile)
 						if retryErr == nil {
 							if retryResp.StatusCode < 400 {
 								// 重试请求被上游接受后同步 ParsedRequest，保证 usage/日志看到真实请求体。
@@ -505,7 +549,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 									retryReq2, retryWireBody2, buildErr2 := s.buildUpstreamRequest(retryCtx2, c, account, filteredBody2, token, tokenType, reqModel, reqStream, shouldMimicClaudeCode)
 									releaseRetryCtx2()
 									if buildErr2 == nil {
-										retryResp2, retryErr2 := s.httpUpstream.DoWithTLS(retryReq2, proxyURL, account.ID, account.Concurrency, tlsProfile)
+										retryResp2, retryErr2 := (failoverAttemptUpstream{s.httpUpstream}).DoWithTLS(retryReq2, proxyURL, account.ID, account.Concurrency, tlsProfile)
 										if retryErr2 == nil {
 											if retryResp2.StatusCode < 400 {
 												// 二阶段工具块降级成功时也必须更新当前 body。
@@ -588,7 +632,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 						budgetRetryReq, budgetWireBody, buildErr := s.buildUpstreamRequest(budgetRetryCtx, c, account, rectifiedBody, token, tokenType, reqModel, reqStream, shouldMimicClaudeCode)
 						releaseBudgetRetryCtx()
 						if buildErr == nil {
-							budgetRetryResp, retryErr := s.httpUpstream.DoWithTLS(budgetRetryReq, proxyURL, account.ID, account.Concurrency, tlsProfile)
+							budgetRetryResp, retryErr := (failoverAttemptUpstream{s.httpUpstream}).DoWithTLS(budgetRetryReq, proxyURL, account.ID, account.Concurrency, tlsProfile)
 							if retryErr == nil {
 								if budgetRetryResp.StatusCode < 400 {
 									// budget 修正请求成功后，ParsedRequest 也要描述被接受的修正版。
@@ -680,7 +724,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 
 	// 处理重试耗尽的情况
 	if resp.StatusCode >= 400 && s.shouldRetryUpstreamError(account, resp.StatusCode) {
-		if s.shouldFailoverUpstreamError(resp.StatusCode) {
+		if s.shouldFailoverForRequest(ctx, resp.StatusCode) {
 			respBody, _ := s.readUpstreamErrorBody(resp)
 			_ = resp.Body.Close()
 			resp.Body = io.NopCloser(bytes.NewReader(respBody))
@@ -717,7 +761,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 	}
 
 	// 处理可切换账号的错误
-	if resp.StatusCode >= 400 && s.shouldFailoverUpstreamError(resp.StatusCode) {
+	if resp.StatusCode >= 400 && s.shouldFailoverForRequest(ctx, resp.StatusCode) {
 		respBody, _ := s.readUpstreamErrorBody(resp)
 		_ = resp.Body.Close()
 		resp.Body = io.NopCloser(bytes.NewReader(respBody))
@@ -751,7 +795,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 	}
 	if resp.StatusCode >= 400 {
 		// 可选：对部分 400 触发 failover（默认关闭以保持语义）
-		if resp.StatusCode == 400 && s.cfg != nil && s.cfg.Gateway.FailoverOn400 {
+		if resp.StatusCode == 400 && s.failover400EnabledForRequest(ctx) {
 			respBody, readErr := s.readUpstreamErrorBody(resp)
 			if readErr != nil {
 				// ReadAll failed, fall back to normal error handling without consuming the stream
@@ -760,7 +804,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 			_ = resp.Body.Close()
 			resp.Body = io.NopCloser(bytes.NewReader(respBody))
 
-			if s.shouldFailoverOn400(respBody) {
+			if s.matchesFailover400ForRequest(ctx, respBody) {
 				upstreamMsg := strings.TrimSpace(extractUpstreamErrorMessage(respBody))
 				upstreamMsg = sanitizeUpstreamErrorMessage(upstreamMsg)
 				upstreamDetail := ""

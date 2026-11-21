@@ -97,6 +97,13 @@
               <span v-if="item.iconSvg" class="h-5 w-5 flex-shrink-0 sidebar-svg-icon" v-html="sanitizeSvg(item.iconSvg)"></span>
               <component v-else :is="item.icon" class="h-5 w-5 flex-shrink-0" />
               <span class="sidebar-label" :class="{ 'sidebar-label-collapsed': sidebarCollapsed }" :aria-hidden="sidebarCollapsed ? 'true' : 'false'">{{ item.label }}</span>
+              <!-- 工单待处理数角标（管理员） -->
+              <span
+                v-if="item.badge && item.badge > 0"
+                class="ml-auto inline-flex min-w-5 items-center justify-center rounded-full bg-primary-600 px-1.5 text-[11px] font-semibold leading-4 text-white tabular-nums"
+                :class="{ 'sr-only': sidebarCollapsed }"
+                :data-testid="`sidebar-badge-${item.path}`"
+              >{{ item.badge > 99 ? '99+' : item.badge }}</span>
             </router-link>
           </template>
         </div>
@@ -199,6 +206,7 @@ import { sanitizeUrl } from '@/utils/url'
 import { FeatureFlags, makeSidebarFlag } from '@/utils/featureFlags'
 import { resolveSiteBillingMode } from '@/utils/siteBillingMode'
 import { useBatchImageAccess } from '@/composables/useBatchImageAccess'
+import { adminTicketsAPI } from '@/api/admin/tickets'
 
 interface NavItem {
   path: string
@@ -219,6 +227,8 @@ interface NavItem {
    * 开关切换时菜单自动更新。
    */
   featureFlag?: () => boolean | undefined
+  /** 可选的数字角标（如管理员待处理工单数）；0 或 undefined 时不显示。 */
+  badge?: number
 }
 
 // applyFeatureFlags 递归过滤掉 featureFlag() === false 的节点（含子节点）。
@@ -675,6 +685,11 @@ const PriceTagIcon = {
     )
 }
 
+// 模型价格管理入口图标（内置模型价格 / 人民币口径）。
+const ModelPricingIcon = {
+  render: () => h(Icon, { name: 'dollar' })
+}
+
 const ChevronDownIcon = {
   render: () =>
     h(
@@ -731,6 +746,8 @@ function buildSelfNavItems(withDashboard: boolean): NavItem[] {
     { path: '/keys', label: t('nav.apiKeys'), icon: KeyIcon },
     { path: '/batch-image', label: t('nav.batchImage'), icon: BatchImageIcon, hideInSimpleMode: true, featureFlag: flagBatchImageAccess },
     { path: '/usage', label: t('nav.usage'), icon: ChartIcon, hideInSimpleMode: true },
+    // 工单中心：用户提交问题并跟踪客服回复。
+    { path: '/tickets', label: t('nav.tickets'), icon: TicketIcon },
     { path: '/available-channels', label: t('nav.availableChannels'), icon: ChannelIcon, hideInSimpleMode: true, featureFlag: flagAvailableChannels },
     { path: '/monitor', label: t('nav.channelStatus'), icon: SignalIcon, featureFlag: flagChannelMonitor },
     { path: '/subscriptions', label: t('nav.mySubscriptions'), icon: CreditCardIcon, hideInSimpleMode: true, featureFlag: flagSubscription },
@@ -779,10 +796,38 @@ const customMenuItemsForAdmin = computed(() => {
 })
 
 // Admin navigation items
+// 管理员端工单待处理（open）计数：懒加载 /admin/tickets/stats，用于侧边栏角标。
+const adminOpenTicketCount = ref(0)
+
+async function refreshAdminOpenTicketCount() {
+  if (!isAdmin.value) return
+  try {
+    const stats = await adminTicketsAPI.stats()
+    adminOpenTicketCount.value = stats.open
+  } catch (error) {
+    console.error('Error loading admin ticket stats:', error)
+    adminOpenTicketCount.value = 0
+  }
+}
+
 const adminNavItems = computed((): NavItem[] => {
   const baseItems: NavItem[] = [
     { path: '/admin/dashboard', label: t('nav.dashboard'), icon: DashboardIcon },
     { path: '/admin/ops', label: t('nav.ops'), icon: ChartIcon, featureFlag: flagOpsMonitoring },
+    // 运营管理（design.md 第二部分 v3.0）：上游对接 / 扩池（对接渠道）/ 利润保护。
+    // 前缀 opsmgmt 与上方可观测性 /admin/ops 严格分开。
+    {
+      path: '/admin/opsmgmt',
+      label: t('nav.opsMgmt'),
+      icon: GlobeIcon,
+      expandOnly: true,
+      children: [
+        { path: '/admin/opsmgmt/dashboard', label: t('nav.opsMgmtDashboard'), icon: ChartIcon },
+        { path: '/admin/opsmgmt/sites', label: t('nav.opsMgmtSites'), icon: ServerIcon },
+        { path: '/admin/opsmgmt/expand', label: t('nav.opsMgmtExpand'), icon: ChannelIcon },
+        { path: '/admin/opsmgmt/profit', label: t('nav.opsMgmtProfit'), icon: ShieldIcon },
+      ],
+    },
     { path: '/admin/users', label: t('nav.users'), icon: UsersIcon, hideInSimpleMode: true },
     { path: '/admin/groups', label: t('nav.groups'), icon: FolderIcon },
     {
@@ -798,9 +843,13 @@ const adminNavItems = computed((): NavItem[] => {
     },
     // 「仅充值」站点连管理端的「订阅管理」入口也一并收起（路由本身不拦截）。
     { path: '/admin/subscriptions', label: t('nav.subscriptions'), icon: CreditCardIcon, hideInSimpleMode: true, featureFlag: flagSubscription },
+    // 模型价格：内置模型价格覆盖与人民币计费口径（放在渠道管理附近）。
+    { path: '/admin/model-pricing', label: t('nav.modelPricing'), icon: ModelPricingIcon },
     { path: '/admin/accounts', label: t('nav.accounts'), icon: GlobeIcon },
     { path: '/admin/plugins', label: t('nav.plugins'), icon: PluginIcon, featureFlag: flagPluginManagement },
     { path: '/admin/announcements', label: t('nav.announcements'), icon: BellIcon },
+    // 工单管理：badge 展示待处理（open）数量。
+    { path: '/admin/tickets', label: t('nav.ticketManagement'), icon: TicketIcon, badge: adminOpenTicketCount.value },
     { path: '/admin/proxies', label: t('nav.proxies'), icon: ServerIcon },
     {
       path: '/admin/security-audit',
@@ -960,10 +1009,21 @@ watch(
   { immediate: true }
 )
 
+// 管理员侧工单角标随进入工单管理页刷新（回复/改状态可能改变 open 数）。
+watch(
+  () => route.path,
+  (path) => {
+    if (path === '/admin/tickets' && isAdmin.value) {
+      void refreshAdminOpenTicketCount()
+    }
+  }
+)
+
 onMounted(() => {
   void refreshBatchImageAccess()
   if (isAdmin.value) {
     adminSettingsStore.fetch()
+    void refreshAdminOpenTicketCount()
   }
   // Restore sidebar scroll position after route change re-mounts the component
   if (appStore.sidebarScrollTop > 0 && sidebarNavRef.value) {

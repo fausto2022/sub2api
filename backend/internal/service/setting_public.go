@@ -369,7 +369,7 @@ func (s *SettingService) GetPublicSettings(ctx context.Context) (*PublicSettings
 
 		SubscriptionEnabled: !isFalseSettingValue(settings[SettingKeySubscriptionEnabled]),
 
-		ModelPlazaEnabled:       settings[SettingKeyModelPlazaEnabled] == "true",
+		ModelPlazaEnabled:       modelPlazaEnabledFromSetting(settings[SettingKeyModelPlazaEnabled]),
 		ModelPlazaRequireAuth:   settings[SettingKeyModelPlazaRequireAuth] == "true",
 		PluginManagementEnabled: settings[SettingKeyPluginManagementEnabled] == "true",
 
@@ -518,19 +518,22 @@ type ModelPlazaRuntime struct {
 }
 
 // GetModelPlazaRuntime reads the model-plaza feature switches directly from the
-// settings store. Fail-closed: on error returns Enabled=false, matching the
-// opt-in default (unknown ↔ disabled).
+// settings store. Fail-open on error: the plaza defaults to enabled (opt-out), so a
+// settings lookup failure keeps the public price list reachable rather than 404ing.
 func (s *SettingService) GetModelPlazaRuntime(ctx context.Context) ModelPlazaRuntime {
+	if s == nil || s.settingRepo == nil {
+		return ModelPlazaRuntime{Enabled: true}
+	}
 	vals, err := s.settingRepo.GetMultiple(ctx, []string{
 		SettingKeyModelPlazaEnabled,
 		SettingKeyModelPlazaRequireAuth,
 		SettingKeyModelPlazaDescription,
 	})
 	if err != nil {
-		return ModelPlazaRuntime{Enabled: false}
+		return ModelPlazaRuntime{Enabled: true}
 	}
 	return ModelPlazaRuntime{
-		Enabled:     vals[SettingKeyModelPlazaEnabled] == "true",
+		Enabled:     modelPlazaEnabledFromSetting(vals[SettingKeyModelPlazaEnabled]),
 		RequireAuth: vals[SettingKeyModelPlazaRequireAuth] == "true",
 		Description: vals[SettingKeyModelPlazaDescription],
 	}

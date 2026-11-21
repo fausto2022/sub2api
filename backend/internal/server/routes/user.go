@@ -161,5 +161,20 @@ func RegisterUserRoutes(
 			monitorV2.GET("/errors", h.ChannelMonitorV2.Errors)
 			monitorV2.GET("/users", h.ChannelMonitorV2.Users)
 		}
+
+		// 工单（用户侧：创建/列表/详情/回复/关闭）
+		tickets := authenticated.Group("/tickets")
+		{
+			tickets.GET("", h.Ticket.List)
+			tickets.POST("", h.Ticket.Create)
+			// 工单图片附件：两阶段上传 + 鉴权代理读取 + 删除未绑定附件
+			// （必须在 /:id 之前声明，避免 "attachments" 被当作工单 ID）。
+			tickets.POST("/attachments", h.TicketAttachment.Upload)
+			tickets.GET("/attachments/:id", h.TicketAttachment.Get)
+			tickets.DELETE("/attachments/:id", h.TicketAttachment.Delete)
+			tickets.GET("/:id", h.Ticket.Get)
+			tickets.POST("/:id/replies", h.Ticket.AddReply)
+			tickets.POST("/:id/close", h.Ticket.Close)
+		}
 	}
 }

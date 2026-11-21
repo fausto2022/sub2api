@@ -578,10 +578,12 @@ type AccountWaitPlan struct {
 }
 
 type AccountSelectionResult struct {
-	Account     *Account
-	Acquired    bool
-	ReleaseFunc func()
-	WaitPlan    *AccountWaitPlan // nil means no wait allowed
+	Account           *Account
+	Acquired          bool
+	ReleaseFunc       func()
+	WaitPlan          *AccountWaitPlan // nil means no wait allowed
+	failoverProbe     *selectionFailoverProbe
+	failoverIsolation bool
 	// stickySessionHit 标记账号来自会话粘性绑定命中，供非高级调度路径回填决策标签。
 	stickySessionHit bool
 	// profitGate 携带本次选号真实生效的利润门（无门为 nil）。门安装在调度栈的
@@ -790,6 +792,8 @@ type GatewayService struct {
 	httpUpstream          HTTPUpstream
 	deferredService       *DeferredService
 	concurrencyService    *ConcurrencyService
+	failoverCooldownStore FailoverCooldownStore
+	failoverPolicyReader  GroupFailoverPolicyReader
 	claudeTokenProvider   *ClaudeTokenProvider
 	sessionLimitCache     SessionLimitCache // 会话数量限制缓存（仅 Anthropic OAuth/SetupToken）
 	rpmCache              RPMCache          // RPM 计数缓存（仅 Anthropic OAuth/SetupToken）
@@ -809,6 +813,49 @@ type GatewayService struct {
 	tlsFPProfileService   *TLSFingerprintProfileService
 	balanceNotifyService  *BalanceNotifyService
 	userPlatformQuotaRepo UserPlatformQuotaRepository
+}
+
+// ConfigureFailoverRouting installs startup-only dependencies on this gateway.
+func (s *GatewayService) ConfigureFailoverRouting(reader GroupFailoverPolicyReader, store FailoverCooldownStore) {
+	s.failoverPolicyReader = reader
+	s.SetFailoverCooldownStore(store)
+}
+
+// WithFailoverRouting installs per-request caches before authenticated routing.
+func (s *GatewayService) WithFailoverRouting(ctx context.Context) context.Context {
+	if s == nil || s.cfg == nil || FailoverRequestPolicyFromContext(ctx) != nil || s.failoverPolicyReader == nil {
+		return ctx
+	}
+	global := FailoverPolicyFromConfig(s.cfg.Gateway.FailoverPolicy)
+	// The loader does not preserve the presence of the new global bool. Keep
+	// the legacy true fallback; an explicit group override still wins.
+	if s.cfg.Gateway.FailoverOn400 {
+		legacy := true
+		global.FailoverOn400 = &legacy
+	}
+	return WithFailoverSelectionSnapshots(WithFailoverRequestPolicy(ctx, s.failoverPolicyReader, global))
+}
+
+// ResolveFailoverRoutingPolicy follows the same authorized group fallback as selection.
+func (s *GatewayService) ResolveFailoverRoutingPolicy(ctx context.Context, groupID *int64) (context.Context, *FailoverPolicy, string) {
+	request := FailoverRequestPolicyFromContext(ctx)
+	if s == nil || request == nil {
+		return ctx, nil, FailoverPolicySourceGlobal
+	}
+	_, resolvedID, err := s.checkClaudeCodeRestriction(ctx, groupID)
+	if err != nil {
+		return ctx, nil, FailoverPolicySourceGlobal
+	}
+	snapshot, _ := request.Resolve(ctx, resolvedID)
+	policy := snapshot.Policy()
+	return WithResolvedGatewayFailoverPolicy(ctx, snapshot), &policy, snapshot.Source
+}
+
+func (s *GatewayService) FailoverIsolation() *FailoverIsolation {
+	if s == nil || s.failoverCooldownStore == nil {
+		return nil
+	}
+	return NewFailoverIsolation(s.failoverCooldownStore)
 }
 
 // NewGatewayService creates a new GatewayService
@@ -970,6 +1017,87 @@ func (s *GatewayService) BindStickySession(ctx context.Context, groupID *int64, 
 		return nil
 	}
 	return s.cache.SetSessionAccountID(ctx, derefGroupID(groupID), sessionHash, accountID, stickySessionTTL)
+}
+
+// —— P2/T2.3 粘性分档清除（B2）———————————————————————————————————————————————
+//
+// 改造前失败路径只做 `ReleaseAccountSession`（释放并发槽位），**不动** session→account
+// 绑定：于是一个已经确定性坏掉的账号会继续持有该会话的粘性绑定，后续请求反复被绑到
+// 它上面（G3 的一半）。但反过来「任何失败都删绑定」也不行：瞬时抖动（限流、同账号
+// 重试、provider 级降载）删绑定会让同一会话在账号间抖动。
+//
+// 因此按失败分档（design §3.1.2c 四档）：
+//
+//	account  → 删（确定性账号问题）
+//	provider → 保留（不是这个账号的错）
+//	request  → 保留（请求本身问题）
+//	绑定透传 → 保留（缓存绑定的语义必须保持）
+//
+// 灰度：只有 `FailoverDecisionGateEnabled()`（P5 接线，默认 false）与配置
+// `switch_order.clear_sticky_on_account_failure`（B2，默认 true）同时成立才生效；
+// 门控关闭时行为与改造前逐字一致（只释放槽位、不删绑定）。
+
+// StickyClearanceInput 是「这次失败要不要清掉粘性绑定」的输入。
+type StickyClearanceInput struct {
+	// GateOn 灰度门控（service.FailoverDecisionGateEnabled，默认 false）。
+	GateOn bool
+	// ConfigEnabled gateway.failover_policy.switch_order.clear_sticky_on_account_failure。
+	ConfigEnabled bool
+	// HasBoundSession 本次请求是否真的存在粘性绑定（false = 无可删）。
+	HasBoundSession bool
+	// Scope 失败归属（account / provider / request）。
+	Scope GatewayFailureScope
+	// RequestScopedTransient 故障与账号无关的上游降载。
+	RequestScopedTransient bool
+	// BoundUpstreamPassthrough 绑定缓存的上游账号响应，原样回写。
+	BoundUpstreamPassthrough bool
+	// RetryableOnSameAccount 既有语义要求先在同账号重试（瞬时抖动）。
+	RetryableOnSameAccount bool
+	// SameAccountRetried 本次请求在该账号上已经重试过（更是瞬时信号）。
+	SameAccountRetried bool
+}
+
+// ShouldClearStickyBinding 返回 (是否清除, 原因)。原因用于日志，便于排障时回答
+// 「为什么绑定被保留了」。
+func ShouldClearStickyBinding(in StickyClearanceInput) (bool, string) {
+	switch {
+	case !in.GateOn:
+		return false, "gate_disabled"
+	case !in.ConfigEnabled:
+		return false, "config_off"
+	case !in.HasBoundSession:
+		return false, "no_binding"
+	case in.BoundUpstreamPassthrough:
+		return false, "bound_passthru"
+	case in.RequestScopedTransient:
+		return false, "request_scoped_transient"
+	case in.RetryableOnSameAccount || in.SameAccountRetried:
+		return false, "transient_retry"
+	case in.Scope == GatewayFailureScopeProvider:
+		return false, "scope_provider"
+	case in.Scope == GatewayFailureScopeRequest:
+		return false, "scope_request"
+	case in.Scope == GatewayFailureScopeAccount:
+		return true, "account_failure"
+	default:
+		return false, "scope_unknown"
+	}
+}
+
+// ClearStickySessionBinding 尽力而为地删除 session→account 绑定。
+//
+// Redis 失败只记 warn、不阻断请求（fail-open）：删绑定是「改善」而不是「正确性前提」，
+// 让它拖垮正在处理中的请求得不偿失（implementation.md T2.3 改动点 2）。
+func (s *GatewayService) ClearStickySessionBinding(ctx context.Context, groupID *int64, sessionHash string) {
+	if s == nil || s.cache == nil || strings.TrimSpace(sessionHash) == "" {
+		return
+	}
+	if err := s.cache.DeleteSessionAccountID(ctx, derefGroupID(groupID), sessionHash); err != nil {
+		slog.Warn("sticky_binding_clear_failed",
+			"group_id", derefGroupID(groupID), "error", err)
+		return
+	}
+	slog.Info("sticky_binding_cleared", "group_id", derefGroupID(groupID))
 }
 
 // bindGatewayStickySessionDuringSelection preserves the normal eager sticky

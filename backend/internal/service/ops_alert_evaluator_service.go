@@ -37,6 +37,8 @@ type OpsAlertEvaluatorService struct {
 	emailService *EmailService
 	proxyRepo    ProxyRepository
 
+	failoverRequestCounts func(context.Context, *OpsDashboardFilter) (OpsFailoverRequestCounts, error)
+
 	redisClient *redis.Client
 	cfg         *config.Config
 	instanceID  string
@@ -80,6 +82,14 @@ func NewOpsAlertEvaluatorService(
 		instanceID:   uuid.NewString(),
 		ruleStates:   map[int64]*opsAlertRuleState{},
 		emailLimiter: newSlidingWindowLimiter(0, time.Hour),
+	}
+}
+
+// SetFailoverMetricsCollector installs the shared SQL reader during startup,
+// before the evaluator starts running rules.
+func (s *OpsAlertEvaluatorService) SetFailoverMetricsCollector(collector *OpsMetricsCollector) {
+	if s != nil && collector != nil {
+		s.failoverRequestCounts = collector.QueryFailoverRequestCounts
 	}
 }
 
@@ -445,6 +455,10 @@ func (s *OpsAlertEvaluatorService) computeRuleMetric(
 		return 0, false
 	}
 	switch strings.TrimSpace(rule.MetricType) {
+	case OpsFailoverSwitchRatioMetric:
+		return s.computeFailoverRatio(ctx, start, end, platform, groupID, false)
+	case OpsFailoverExhaustedRatioMetric:
+		return s.computeFailoverRatio(ctx, start, end, platform, groupID, true)
 	case "cpu_usage_percent":
 		if systemMetrics != nil && systemMetrics.CPUUsagePercent != nil {
 			return *systemMetrics.CPUUsagePercent, true
@@ -616,6 +630,41 @@ func (s *OpsAlertEvaluatorService) computeRuleMetric(
 	default:
 		return 0, false
 	}
+}
+
+func (s *OpsAlertEvaluatorService) computeFailoverRatio(ctx context.Context, start, end time.Time, platform string, groupID *int64, exhausted bool) (float64, bool) {
+	if s == nil || s.opsRepo == nil || s.failoverRequestCounts == nil || !start.Before(end) {
+		return 0, false
+	}
+	filter := &OpsDashboardFilter{
+		StartTime: start,
+		EndTime:   end,
+		Platform:  strings.TrimSpace(platform),
+		GroupID:   groupID,
+		QueryMode: OpsQueryModeRaw,
+	}
+	traffic, err := s.opsRepo.GetWindowStats(ctx, filter)
+	if err != nil || traffic == nil {
+		return 0, false
+	}
+	total := traffic.SuccessCount + traffic.ErrorCountTotal
+	if total <= 0 {
+		return 0, false
+	}
+	counts, err := s.failoverRequestCounts(ctx, filter)
+	if err != nil {
+		return 0, false
+	}
+	affected := counts.Switched
+	if exhausted {
+		affected = counts.Exhausted
+	}
+	// The sources can temporarily disagree because usage and error logs are
+	// queued separately. Treat an impossible sample as unavailable.
+	if affected < 0 || affected > total {
+		return 0, false
+	}
+	return 100 * float64(affected) / float64(total), true
 }
 
 func compareMetric(value float64, operator string, threshold float64) bool {

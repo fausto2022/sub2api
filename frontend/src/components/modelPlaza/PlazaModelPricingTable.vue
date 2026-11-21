@@ -2,13 +2,17 @@
   <div class="plaza-pricing-table overflow-x-auto" :style="accentStyle">
     <table class="w-full min-w-[1000px] table-auto border-collapse text-sm tabular-nums">
       <colgroup>
-        <col class="w-[25%]" />
+        <col :class="showCatalogColumn ? 'w-[19%]' : 'w-[25%]'" />
+        <!-- 目录价列：组内无模型纳入目录价时不渲染（design.md §4.3） -->
+        <col v-if="showCatalogColumn" class="w-[11%]" />
         <col class="w-[11%]" />
         <col class="w-[9%]" />
         <col class="w-[14%]" />
         <col class="w-[11%]" />
         <col class="w-[8%]" />
         <col class="w-[14%]" />
+        <!-- 峰时价列：组内无模型启用峰谷时不渲染 -->
+        <col v-if="showPeakColumn" class="w-[12%]" />
         <col class="w-[8%]" />
       </colgroup>
       <thead>
@@ -21,9 +25,24 @@
           >
             {{ t('modelPlaza.table.model') }}
           </th>
+          <!-- 目录价（未乘倍率）：后端 catalog_pricing 为 null 的模型显示 - -->
+          <th
+            v-if="showCatalogColumn"
+            rowspan="2"
+            class="border-r border-gray-100 py-2.5 pl-3 pr-3 text-left align-middle dark:border-dark-700/60"
+            :title="t('modelPlaza.table.catalogPriceHint')"
+          >
+            <div>{{ t('modelPlaza.table.catalogPrice') }}</div>
+            <div class="mt-0.5 normal-case font-normal text-gray-400 dark:text-dark-500">
+              {{ t('modelPlaza.table.unitPerMillion') }}
+            </div>
+          </th>
           <th colspan="3" class="pz-bg pt-2 text-center">
-            <div class="pz-title border-b pb-2 font-semibold">
-              {{ t('modelPlaza.table.paidPrice') }}
+            <div
+              class="pz-title border-b pb-2 font-semibold"
+              :title="t('modelPlaza.table.discountedPriceHint')"
+            >
+              {{ t('modelPlaza.table.discountedPrice') }}
               <span class="pz-unit ml-1 normal-case font-normal">{{ t('modelPlaza.table.unitPerMillion') }}</span>
             </div>
           </th>
@@ -34,6 +53,18 @@
             <div class="border-b border-gray-200 pb-2 text-gray-400 dark:border-dark-600 dark:text-dark-500">
               {{ t('modelPlaza.table.officialPrice') }}
               <span class="ml-1 normal-case font-normal text-gray-400 dark:text-dark-500">{{ t('modelPlaza.table.unitPerMillion') }}</span>
+            </div>
+          </th>
+          <!-- 峰时价：未乘倍率的模型级峰价按生效倍率折算 -->
+          <th
+            v-if="showPeakColumn"
+            rowspan="2"
+            class="border-l border-gray-100 py-2.5 pl-3 pr-3 text-left align-middle dark:border-dark-700/60"
+            :title="t('modelPlaza.table.peakPriceHint')"
+          >
+            <div>{{ t('modelPlaza.table.peakPrice') }}</div>
+            <div class="mt-0.5 normal-case font-normal text-gray-400 dark:text-dark-500">
+              {{ t('modelPlaza.table.unitPerMillion') }}
             </div>
           </th>
           <th
@@ -111,6 +142,27 @@
             </div>
           </td>
 
+          <!-- 目录价（未乘倍率）：catalog_pricing 为 null 显示 -，表示该模型未纳入目录价 -->
+          <td
+            v-if="showCatalogColumn"
+            class="pz-catalog border-r border-gray-100 px-3 py-2.5 align-middle font-mono text-xs text-gray-500 dark:border-dark-700/60 dark:text-dark-400"
+          >
+            <template v-if="catalogIntervals(m).length">
+              <div
+                v-for="(iv, idx) in catalogIntervals(m)"
+                :key="idx"
+                class="whitespace-nowrap leading-5"
+              >
+                <span class="mr-1 font-sans text-gray-400 dark:text-dark-500" :title="tierHint(m)">{{ tierLabel(iv) }}</span>
+                {{ catalogPrice(iv.input_price) }} / {{ catalogPrice(iv.output_price) }}
+              </div>
+            </template>
+            <template v-else-if="m.catalog_pricing">
+              {{ catalogPrice(m.catalog_pricing.input_price) }} / {{ catalogPrice(m.catalog_pricing.output_price) }}
+            </template>
+            <span v-else class="text-gray-400 dark:text-dark-500">-</span>
+          </td>
+
           <!-- token 计费:输入 / 输出 / 缓存(写/读),有阶梯时每档一行;档位标签只放输入列,其余列按行对齐 -->
           <template v-if="billingMode(m) === BILLING_MODE_TOKEN">
             <td class="pz-cell px-3 py-2.5 align-middle font-mono font-semibold text-gray-900 dark:text-gray-50">
@@ -121,10 +173,10 @@
                   class="whitespace-nowrap text-xs leading-5"
                 >
                   <span class="mr-1 font-sans font-normal text-gray-400 dark:text-dark-500" :title="tierHint(m)">{{ tierLabel(iv) }}</span>
-                  {{ paidPerMillion(iv.input_price, period) }}
+                  {{ paidPerMillionTier(m, iv, 'input_price', period) }}
                 </div>
               </template>
-              <template v-else>{{ paidPerMillion(m.pricing?.input_price, period) }}</template>
+              <template v-else>{{ paidPerMillion(m, 'input_price', period) }}</template>
             </td>
             <td class="pz-cell px-3 py-2.5 align-middle font-mono font-semibold text-gray-900 dark:text-gray-50">
               <template v-if="tokenIntervals(m).length">
@@ -134,10 +186,10 @@
                   class="whitespace-nowrap text-xs leading-5"
                   :title="tierHint(m)"
                 >
-                  {{ paidPerMillion(iv.output_price, period) }}
+                  {{ paidPerMillionTier(m, iv, 'output_price', period) }}
                 </div>
               </template>
-              <template v-else>{{ paidPerMillion(m.pricing?.output_price, period) }}</template>
+              <template v-else>{{ paidPerMillion(m, 'output_price', period) }}</template>
             </td>
             <td class="pz-cell px-3 py-2.5 align-middle">
               <template v-if="hasTierCachePricing(tokenIntervals(m))">
@@ -149,16 +201,16 @@
                 >
                   <template v-if="iv.cache_write_price != null || iv.cache_write_1h_price != null || iv.cache_write_12h_price != null || iv.cache_read_price != null">
                     <span class="font-sans font-normal text-gray-400 dark:text-dark-500">{{ t('modelPlaza.table.cacheWriteShort') }}</span>
-                    {{ paidPerMillion(iv.cache_write_price, period) }}
+                    {{ paidPerMillionTier(m, iv, 'cache_write_price', period) }}
                     <template v-if="iv.cache_write_1h_price != null"
-                      ><span class="font-sans font-normal text-gray-400 dark:text-dark-500"> (1h </span>{{ paidPerMillion(iv.cache_write_1h_price, period)
+                      ><span class="font-sans font-normal text-gray-400 dark:text-dark-500"> (1h </span>{{ paidPerMillionTier(m, iv, 'cache_write_1h_price', period)
                       }}<span class="font-sans font-normal text-gray-400 dark:text-dark-500">)</span></template
                     ><template v-if="iv.cache_write_12h_price != null"
-                      ><span class="font-sans font-normal text-gray-400 dark:text-dark-500"> (12h </span>{{ paidPerMillion(iv.cache_write_12h_price, period)
+                      ><span class="font-sans font-normal text-gray-400 dark:text-dark-500"> (12h </span>{{ paidPerMillionTier(m, iv, 'cache_write_12h_price', period)
                       }}<span class="font-sans font-normal text-gray-400 dark:text-dark-500">)</span></template
                     >
                     <span class="ml-1 font-sans font-normal text-gray-400 dark:text-dark-500">{{ t('modelPlaza.table.cacheReadShort') }}</span>
-                    {{ paidPerMillion(iv.cache_read_price, period) }}
+                    {{ paidPerMillionTier(m, iv, 'cache_read_price', period) }}
                   </template>
                   <span v-else class="text-gray-400 dark:text-dark-500">-</span>
                 </div>
@@ -169,18 +221,18 @@
               >
                 <div>
                   <span class="mr-1 font-sans font-normal text-gray-400 dark:text-dark-500">{{ t('modelPlaza.table.cacheWrite') }}</span>
-                  {{ paidPerMillion(m.pricing?.cache_write_price, period)
+                  {{ paidPerMillion(m, 'cache_write_price', period)
                   }}<template v-if="m.pricing?.cache_write_1h_price != null"
-                    ><span class="font-sans font-normal text-gray-400 dark:text-dark-500"> (1h </span>{{ paidPerMillion(m.pricing.cache_write_1h_price, period)
+                    ><span class="font-sans font-normal text-gray-400 dark:text-dark-500"> (1h </span>{{ paidPerMillion(m, 'cache_write_1h_price', period)
                     }}<span class="font-sans font-normal text-gray-400 dark:text-dark-500">)</span></template
                   ><template v-if="m.pricing?.cache_write_12h_price != null"
-                    ><span class="font-sans font-normal text-gray-400 dark:text-dark-500"> (12h </span>{{ paidPerMillion(m.pricing.cache_write_12h_price, period)
+                    ><span class="font-sans font-normal text-gray-400 dark:text-dark-500"> (12h </span>{{ paidPerMillion(m, 'cache_write_12h_price', period)
                     }}<span class="font-sans font-normal text-gray-400 dark:text-dark-500">)</span></template
                   >
                 </div>
                 <div>
                   <span class="mr-1 font-sans font-normal text-gray-400 dark:text-dark-500">{{ t('modelPlaza.table.cacheRead') }}</span>
-                  {{ paidPerMillion(m.pricing?.cache_read_price, period) }}
+                  {{ paidPerMillion(m, 'cache_read_price', period) }}
                 </div>
               </div>
               <span v-else class="text-gray-400 dark:text-dark-500">-</span>
@@ -200,7 +252,7 @@
                   class="inline-flex items-center gap-1 rounded-md bg-gray-100 px-2 py-0.5 font-mono text-xs text-gray-800 dark:bg-dark-700/60 dark:text-gray-200"
                 >
                   <span class="font-sans text-gray-400 dark:text-dark-500">{{ tierLabel(iv) }}</span>
-                  {{ paidRequestPrice(m, iv.per_request_price)
+                  {{ paidRequestPriceTier(m, iv, iv.per_request_price)
                   }}<span class="font-sans text-gray-400 dark:text-dark-500">{{ perUnitSuffix(m) }}</span>
                 </span>
               </div>
@@ -290,6 +342,21 @@
             <span v-else class="text-gray-400 dark:text-dark-500">-</span>
           </td>
 
+          <!-- 峰时价：模型级峰价比生效倍率折算，便于与折后价同口径对照 -->
+          <td
+            v-if="showPeakColumn"
+            class="border-l border-gray-100 px-3 py-2.5 align-middle font-mono text-xs dark:border-dark-700/60"
+          >
+            <template v-if="m.peak_pricing">
+              <div class="whitespace-nowrap text-amber-700 dark:text-amber-300">
+                {{ peakPrice(m.peak_pricing.input_price) }}
+                <span class="mx-0.5 font-sans text-gray-400 dark:text-dark-500">/</span>
+                {{ peakPrice(m.peak_pricing.output_price) }}
+              </div>
+            </template>
+            <span v-else class="text-gray-400 dark:text-dark-500">-</span>
+          </td>
+
           <!-- 折扣倍率(分时时段行展示 生效倍率×时段倍率;生图独立倍率行展示独立倍率;专属倍率划线展示原倍率) -->
           <td
             class="border-l border-gray-100 py-2.5 pl-3 pr-5 text-right align-middle font-mono text-xs dark:border-dark-700/60"
@@ -320,7 +387,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { formatScaled, resolveIntervalPrices } from '@/utils/pricing'
+import { formatScaled, resolveIntervalPrices, scalePricing } from '@/utils/pricing'
 import { platformAccentColor, platformBadgeLightClass, platformLabel } from '@/utils/platformColors'
 import {
   BILLING_MODE_TOKEN,
@@ -330,7 +397,7 @@ import {
   type BillingMode
 } from '@/constants/channel'
 import type { PlazaModel, PlazaTimePricingPeriod } from '@/api/modelPlaza'
-import type { UserPricingInterval } from '@/api/channels'
+import type { UserPricingInterval, UserSupportedModelPricing } from '@/api/channels'
 
 function reasoningEffortMultipliers(model: PlazaModel): [string, number][] {
   const multipliers = model.pricing?.reasoning_effort_multipliers
@@ -397,6 +464,15 @@ const hasCustomRate = computed(
   () => props.userRateMultiplier != null && props.userRateMultiplier !== props.rateMultiplier
 )
 
+/**
+ * 目录价列：分组内至少一个模型被目录价层接管时才渲染（design.md §4.3）。
+ * catalog_pricing 为 null 的模型在该列显示 «-»。
+ */
+const showCatalogColumn = computed(() => props.models.some((m) => m.catalog_pricing != null))
+
+/** 峰时价列：分组内至少一个模型启用模型级峰谷时才渲染，否则整列隐藏。 */
+const showPeakColumn = computed(() => props.models.some((m) => m.peak_pricing != null))
+
 function billingMode(m: PlazaModel): BillingMode {
   return (m.pricing?.billing_mode || BILLING_MODE_TOKEN) as BillingMode
 }
@@ -434,11 +510,93 @@ function periodRate(period: PlazaTimePricingPeriod): number {
   return Math.round(effectiveRate.value * period.multiplier * 1000) / 1000
 }
 
-/** 实付价 = 渠道单价 × 生效倍率(时段行再乘时段倍率),按 $/1M token 展示。 */
-function paidPerMillion(value: number | null | undefined, period: PlazaTimePricingPeriod | null = null): string {
+/** 可展示的 token 单价字段名。 */
+type TokenPriceKey = 'input_price' | 'output_price' | 'cache_write_price' | 'cache_write_1h_price' | 'cache_write_12h_price' | 'cache_read_price'
+
+/**
+ * 折后价的展示数据源——design.md §4.3 的核心契约。
+ *
+ * 优先用后端预计算的 `discounted_pricing`：由 `PlazaDiscountedPricing` 按**生效倍率**
+ * 折算，已含登录态专属倍率与图片/视频独立倍率，与计费同源。前端若再乘一次
+ * `rate_multiplier`，专属倍率用户会看到与实付不一致的价格。
+ *
+ * 仅当后端未下发（旧响应）时才回退本地 `pricing × 生效倍率`。
+ */
+const displayPricing = computed<Map<string, UserSupportedModelPricing>>(() => {
+  const out = new Map<string, UserSupportedModelPricing>()
+  for (const m of props.models) {
+    if (m.pricing == null) continue
+    out.set(modelKey(m), m.discounted_pricing ?? scalePricing(m.pricing, effectiveRate.value))
+  }
+  return out
+})
+
+/** 模型在投影里的主键：composite 分组下同名模型来自不同平台。 */
+function modelKey(m: PlazaModel): string {
+  return `${m.platform}:${m.name}`
+}
+
+/** 取模型折后价投影（未乘分时倍率）。 */
+function discounted(m: PlazaModel): UserSupportedModelPricing | null {
+  return displayPricing.value.get(modelKey(m)) ?? null
+}
+
+/** 目录价原值（未乘倍率），按 $/1M token 展示。 */
+function catalogPrice(value: number | null | undefined): string {
   if (value == null) return '-'
-  const rate = period ? periodRate(period) : effectiveRate.value
-  return formatScaled(value * rate, PER_MILLION, MIN_DECIMALS)
+  return formatScaled(value, PER_MILLION, MIN_DECIMALS)
+}
+
+/**
+ * 峰时价按生效倍率折算后展示：峰价是模型级绝对价（未乘倍率），
+ * 折算后与折后价同口径，便于与目录价/折后价直接对照。
+ */
+function peakPrice(value: number | null | undefined): string {
+  if (value == null) return '-'
+  return formatScaled(value * effectiveRate.value, PER_MILLION, MIN_DECIMALS)
+}
+
+/** 实付/折后价展示（$/1M token），时段行再乘时段倍率。 */
+function paidPerMillion(
+  m: PlazaModel,
+  key: TokenPriceKey,
+  period: PlazaTimePricingPeriod | null = null
+): string {
+  const value = discounted(m)?.[key]
+  if (value == null) return '-'
+  const scaled = period ? value * period.multiplier : value
+  return formatScaled(scaled, PER_MILLION, MIN_DECIMALS)
+}
+
+/** 阶梯档的折后价展示：优先按档位区间匹配后端折后价阶梯，未下发时按解析后的档位价 × 生效倍率。 */
+function paidPerMillionTier(
+  m: PlazaModel,
+  iv: UserPricingInterval,
+  key: TokenPriceKey,
+  period: PlazaTimePricingPeriod | null = null
+): string {
+  const value = discountedTierValue(m, iv, key)
+  if (value == null) return '-'
+  const scaled = period ? value * period.multiplier : value
+  return formatScaled(scaled, PER_MILLION, MIN_DECIMALS)
+}
+
+/**
+ * 档位折后单价：后端 `discounted_pricing.intervals` 与 `pricing.intervals` 同源同序，
+ * 但展示前会按上下文排序/过滤，因此按区间（min/max tokens）配对而非下标。
+ * iv 传入的已是 `resolveIntervalPrices` 解析过相对倍率的档位价。
+ */
+function discountedTierValue(
+  m: PlazaModel,
+  iv: UserPricingInterval,
+  key: TokenPriceKey
+): number | null {
+  const preset = m.discounted_pricing?.intervals?.find(
+    (d) => d.min_tokens === iv.min_tokens && d.max_tokens === iv.max_tokens
+  )?.[key]
+  if (preset != null) return preset
+  const base = iv[key]
+  return base == null ? null : base * effectiveRate.value
 }
 
 /** 图片和视频分别使用对应的独立倍率开关。 */
@@ -457,10 +615,27 @@ function requestRate(m: PlazaModel): number {
     : effectiveRate.value
 }
 
-/** 非 token 单价乘该行生效倍率，不换算为每百万 token。 */
+/**
+ * 非 token 单价（已含独立倍率）展示。
+ *
+ * 同样优先用 discounted_pricing.per_request_price：后端按独立的图片/视频倍率折算，
+ * 前端重复相乘会在独立倍率分组上算错。
+ */
 function paidRequestPrice(m: PlazaModel, value: number | null | undefined): string {
   if (value == null) return '-'
-  return formatScaled(value * requestRate(m), 1, MIN_DECIMALS)
+  const preset = m.discounted_pricing?.per_request_price
+  const resolved = preset ?? value * requestRate(m)
+  return formatScaled(resolved, 1, MIN_DECIMALS)
+}
+
+/** 按次/按图阶梯芯片的折后价：同样按档位区间配对后端折后价阶梯，未下发时本地折算。 */
+function paidRequestPriceTier(m: PlazaModel, iv: UserPricingInterval, value: number | null | undefined): string {
+  if (value == null) return '-'
+  const preset = m.discounted_pricing?.intervals?.find(
+    (d) => d.min_tokens === iv.min_tokens && d.max_tokens === iv.max_tokens
+  )?.per_request_price
+  const resolved = preset ?? value * requestRate(m)
+  return formatScaled(resolved, 1, MIN_DECIMALS)
 }
 
 /** 官方参考价不乘倍率。 */
@@ -526,6 +701,11 @@ function tokenIntervals(m: PlazaModel): UserPricingInterval[] {
 /** 官方阶梯(后端按目录规则合成,不受分组开关影响)。 */
 function officialIntervals(m: PlazaModel): UserPricingInterval[] {
   return sortByContext(m.official_pricing?.intervals ?? [])
+}
+
+/** 目录价阶梯：目录价带多档时逐档展示，未下发 catalog_pricing 的模型为空。 */
+function catalogIntervals(m: PlazaModel): UserPricingInterval[] {
+  return sortByContext(m.catalog_pricing?.intervals ?? [])
 }
 
 /** 任一档带缓存价才按档渲染缓存列;否则沿用平价的写入/读取两行。 */

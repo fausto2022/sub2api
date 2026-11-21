@@ -1429,6 +1429,31 @@ func (s *BillingService) CacheStoragePricePerTokenHour(model string) float64 {
 	return builtinGeminiCacheStoragePrice(model)
 }
 
+// pricingManagedByAdmin 报告模型是否被管理员显式接管（override 文件条目或人民币层
+// 登记）。命中的模型必须让位：DeepSeek 官方强制价与峰谷倍率都不得覆盖管理员配置。
+func (s *BillingService) pricingManagedByAdmin(model string) bool {
+	if s == nil || s.pricingService == nil {
+		return false
+	}
+	return s.pricingService.HasManagedPricing(model)
+}
+
+// lookupPeakPricing 返回模型的峰谷双价配置；未启用自定义峰谷时返回 false。
+func (s *BillingService) lookupPeakPricing(model string) (PeakAwarePricing, bool) {
+	if s == nil || s.pricingService == nil {
+		return PeakAwarePricing{}, false
+	}
+	return s.pricingService.PeakPricingFor(model)
+}
+
+// peakPricingSettingsSnapshot 返回当前全局峰谷时段设置。
+func (s *BillingService) peakPricingSettingsSnapshot() PeakPricingSettings {
+	if s == nil || s.pricingService == nil {
+		return defaultPeakPricingSettings()
+	}
+	return s.pricingService.PeakPricingSettings()
+}
+
 // getModelPricingAt 保留带计费时点的内部调用接口。DeepSeek 默认低谷价
 // 仅由模型决定，峰谷倍率由统一计费入口按请求时点处理。
 func (s *BillingService) getModelPricingAt(model string, pricingAt time.Time) (*ModelPricing, error) {
@@ -1453,6 +1478,9 @@ func (s *BillingService) getModelPricingAt(model string, pricingAt time.Time) (*
 			price5m := litellmPricing.CacheCreationInputTokenCost
 			price1h := litellmPricing.CacheCreationInputTokenCostAbove1hr
 			enableBreakdown := price1h > 0 && price1h > price5m
+			// 管理员显式接管（override / 人民币层）的模型让位：DeepSeek 官方价不得
+			// 覆盖运营者配置。
+			applyOfficialRates := !s.pricingManagedByAdmin(model)
 			return s.applyModelSpecificPricingPolicyEx(model, &ModelPricing{
 				InputPricePerToken:                 litellmPricing.InputCostPerToken,
 				InputPricePerTokenPriority:         litellmPricing.InputCostPerTokenPriority,
@@ -1474,7 +1502,7 @@ func (s *BillingService) getModelPricingAt(model string, pricingAt time.Time) (*
 				ImageInputPricePerToken:       litellmPricing.InputCostPerImageToken,
 				ImageCacheReadPricePerToken:   litellmPricing.CacheReadInputImageTokenCost,
 				ImageOutputPricePerToken:      litellmPricing.OutputCostPerImageToken,
-			}, true, pricingAt), nil
+			}, applyOfficialRates, pricingAt), nil
 		}
 	}
 
@@ -1671,13 +1699,26 @@ func (s *BillingService) calculateTokenCost(resolved *ResolvedPricing, input Cos
 
 	// 默认价卡（Source=LiteLLM）应用 DeepSeek 官方价强制覆盖（幂等，GetModelPricing
 	// 内部已强制过）；分组/渠道自定义定价保留运营者配置，不强制覆盖官方价。
-	pricing = s.applyModelSpecificPricingPolicyEx(input.Model, pricing, resolved.Source == PricingSourceLiteLLM, pricingAt)
+	// 管理员通过 override / 人民币层显式接管的模型同样让位。
+	managedByAdmin := s.pricingManagedByAdmin(input.Model)
+	applyOfficialRates := resolved.Source == PricingSourceLiteLLM && !managedByAdmin
+	pricing = s.applyModelSpecificPricingPolicyEx(input.Model, pricing, applyOfficialRates, pricingAt)
+
+	// 模型级自定义峰谷价（管理端在「模型价格」页配置）：优先于 DeepSeek 官方
+	// 倍率，二者互斥——一旦启用自定义峰谷，就不再叠加官方 2× 倍率，
+	// 避免高峰时段被放大两次（design.md §0.4 / A7）。
+	peakApplied := false
+	if peak, ok := s.lookupPeakPricing(input.Model); ok && peak.Enabled {
+		pricing = ResolvePeakPricing(pricing, peak, s.peakPricingSettingsSnapshot(), pricingAt)
+		peakApplied = true
+	}
 
 	// DeepSeek 模型默认价卡按官方峰谷口径调整：高峰时段（01:00–04:00 与
 	// 06:00–10:00 UTC，仅工作日；北京时间周末全天低谷）按 2× 低谷价计费。
-	// 仅作用于默认价卡（Source=LiteLLM，无分组/渠道自定义定价）——分组/渠道
-	// 自定义定价保持运营者语义，不叠加。先克隆再乘，避免污染共享 fallbackPrices 指针。
-	if resolved.Source == PricingSourceLiteLLM && isDeepSeekModel(input.Model) {
+	// 仅作用于默认价卡（Source=LiteLLM，无分组/渠道自定义定价、无管理员接管）——
+	// 分组/渠道自定义定价与管理员配置保持运营者语义，不叠加。先克隆再乘，
+	// 避免污染共享 fallbackPrices 指针。
+	if !peakApplied && resolved.Source == PricingSourceLiteLLM && !managedByAdmin && isDeepSeekModel(input.Model) {
 		if mult := deepseekPeakMultiplierAt(pricingAt); mult > 1 {
 			cloned := *pricing
 			cloned.InputPricePerToken *= mult

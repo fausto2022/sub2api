@@ -2841,3 +2841,277 @@ func TestLoadSimpleModeAutoCreateDefaultGroups(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// gateway.failover_policy：默认值表 + Validate（implementation.md T0.1）
+// ---------------------------------------------------------------------------
+
+// TestFailoverPolicyDefaultsMatchCurrentBehaviorState 逐键锁定默认值。
+//
+// 这是「零默认行为变更」的硬门禁（implementation.md §1.6）：每一行同时断言
+// viper 默认值（环境变量通路的可达性）与结构体字段（mapstructure tag 拼写），
+// 任何一处漏注册或 tag 写错都会在这里红。
+//
+// 两个故意与 design.md 不同的默认值，均已在 implementation.md 登记为裁决：
+//   - max_selection_retries = 0（design 写 1；§1.3-D1 裁决「默认 0，发布手册建议 1」）
+//   - terminal.mixed_status_503 = false（design 写 true 即 B3 行为变更；用户尚未裁决，
+//     按「零默认行为变更」保守取 false，P5/T5.4 确认后再翻）
+func TestFailoverPolicyDefaultsMatchCurrentBehaviorState(t *testing.T) {
+	resetViperWithJWTSecret(t)
+
+	cfg, err := Load()
+	require.NoError(t, err, "默认值必须能通过 Validate：生产路径上 Load() 就是先落默认值再校验")
+	fp := cfg.Gateway.FailoverPolicy
+
+	type defaultCase struct {
+		key   string
+		want  any
+		field func(GatewayFailoverPolicyConfig) any
+	}
+
+	compat400Keywords := []string{
+		"anthropic-beta", "beta feature", "requires beta",
+		"thinking", "thought_signature", "signature",
+		"tool_use", "tool_result", "tools",
+	}
+
+	cases := []defaultCase{
+		{"gateway.failover_policy.enabled", true, func(fp GatewayFailoverPolicyConfig) any { return fp.Enabled }},
+		{"gateway.failover_policy.network_errors.enabled", true, func(fp GatewayFailoverPolicyConfig) any { return fp.NetworkErrors.Enabled }},
+		{"gateway.failover_policy.failover_on_400", false, func(fp GatewayFailoverPolicyConfig) any { return fp.FailoverOn400 }},
+		{"gateway.failover_policy.compat_400_keywords", compat400Keywords, func(fp GatewayFailoverPolicyConfig) any { return fp.Compat400Keywords }},
+		{"gateway.failover_policy.same_account.default_mode", FailoverSameAccountModeInherit, func(fp GatewayFailoverPolicyConfig) any { return fp.SameAccount.DefaultMode }},
+		{"gateway.failover_policy.budget.total_timeout", time.Duration(0), func(fp GatewayFailoverPolicyConfig) any { return fp.Budget.TotalTimeout }},
+		{"gateway.failover_policy.budget.per_account_timeout", time.Duration(0), func(fp GatewayFailoverPolicyConfig) any { return fp.Budget.PerAccountTimeout }},
+		{"gateway.failover_policy.budget.max_total_upstream_attempts", 0, func(fp GatewayFailoverPolicyConfig) any { return fp.Budget.MaxTotalUpstreamAttempts }},
+		{"gateway.failover_policy.budget.max_same_account_attempts_total", 0, func(fp GatewayFailoverPolicyConfig) any { return fp.Budget.MaxSameAccountAttemptsTotal }},
+		{"gateway.failover_policy.budget.min_switch_cost", 2 * time.Second, func(fp GatewayFailoverPolicyConfig) any { return fp.Budget.MinSwitchCost }},
+		{"gateway.failover_policy.budget.stop_clock_on_stream", true, func(fp GatewayFailoverPolicyConfig) any { return fp.Budget.StopClockOnStream }},
+		{"gateway.failover_policy.first_output_timeout_seconds", 0, func(fp GatewayFailoverPolicyConfig) any { return fp.FirstOutputTimeoutSeconds }},
+		{"gateway.failover_policy.cooldown.enabled", false, func(fp GatewayFailoverPolicyConfig) any { return fp.Cooldown.Enabled }},
+		{"gateway.failover_policy.cooldown.consecutive_failures_threshold", 3, func(fp GatewayFailoverPolicyConfig) any { return fp.Cooldown.ConsecutiveFailuresThreshold }},
+		{"gateway.failover_policy.cooldown.streak_window", 120 * time.Second, func(fp GatewayFailoverPolicyConfig) any { return fp.Cooldown.StreakWindow }},
+		{"gateway.failover_policy.cooldown.default_ttl", 60 * time.Second, func(fp GatewayFailoverPolicyConfig) any { return fp.Cooldown.DefaultTTL }},
+		{"gateway.failover_policy.cooldown.max_ttl", 24 * time.Hour, func(fp GatewayFailoverPolicyConfig) any { return fp.Cooldown.MaxTTL }},
+		{"gateway.failover_policy.cooldown.pool_mode_enabled", true, func(fp GatewayFailoverPolicyConfig) any { return fp.Cooldown.PoolModeEnabled }},
+		{"gateway.failover_policy.cooldown.probe_enabled", true, func(fp GatewayFailoverPolicyConfig) any { return fp.Cooldown.ProbeEnabled }},
+		{"gateway.failover_policy.cooldown.probe_max_attempts", 3, func(fp GatewayFailoverPolicyConfig) any { return fp.Cooldown.ProbeMaxAttempts }},
+		{"gateway.failover_policy.cooldown.redis_timeout", 500 * time.Millisecond, func(fp GatewayFailoverPolicyConfig) any { return fp.Cooldown.RedisTimeout }},
+		{"gateway.failover_policy.cooldown.fail_open", true, func(fp GatewayFailoverPolicyConfig) any { return fp.Cooldown.FailOpen }},
+		{"gateway.failover_policy.cooldown.batch_read_max", 200, func(fp GatewayFailoverPolicyConfig) any { return fp.Cooldown.BatchReadMax }},
+		{"gateway.failover_policy.switch_order.record_chain", true, func(fp GatewayFailoverPolicyConfig) any { return fp.SwitchOrder.RecordChain }},
+		{"gateway.failover_policy.switch_order.clear_sticky_on_account_failure", true, func(fp GatewayFailoverPolicyConfig) any { return fp.SwitchOrder.ClearStickyOnAccountFailure }},
+		{"gateway.failover_policy.max_selection_retries", 0, func(fp GatewayFailoverPolicyConfig) any { return fp.MaxSelectionRetries }},
+		{"gateway.failover_policy.switchable.use_semantic_bytes", true, func(fp GatewayFailoverPolicyConfig) any { return fp.Switchable.UseSemanticBytes }},
+		{"gateway.failover_policy.switchable.treat_keepalive_as_safe", true, func(fp GatewayFailoverPolicyConfig) any { return fp.Switchable.TreatKeepaliveAsSafe }},
+		{"gateway.failover_policy.idempotency.require_key_for_side_effecting", false, func(fp GatewayFailoverPolicyConfig) any { return fp.Idempotency.RequireKeyForSideEffecting }},
+		{"gateway.failover_policy.t3.only_extend", true, func(fp GatewayFailoverPolicyConfig) any { return fp.T3.OnlyExtend }},
+		{"gateway.failover_policy.expose_failover_detail", false, func(fp GatewayFailoverPolicyConfig) any { return fp.ExposeFailoverDetail }},
+		{"gateway.failover_policy.terminal.mixed_status_503", false, func(fp GatewayFailoverPolicyConfig) any { return fp.Terminal.MixedStatus503 }},
+		{"gateway.failover_policy.cost_attempts.enabled", false, func(fp GatewayFailoverPolicyConfig) any { return fp.CostAttempts.Enabled }},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.key, func(t *testing.T) {
+			require.Equal(t, tc.want, viper.Get(tc.key),
+				"%s 的 viper 默认值未注册或取值不符（环境变量会静默失效）", tc.key)
+			require.Equal(t, tc.want, tc.field(fp),
+				"%s 的字段默认值与 viper 默认值不一致（mapstructure tag 疑似写错）", tc.key)
+		})
+	}
+
+	// 结构化切片默认值：viper 只支持标量切片的环境变量通路，因此由 load() 落地。
+	require.Empty(t, fp.Idempotency.BlockedTools)
+	require.NotContains(t, strings.Join(viper.AllKeys(), ","), "gateway.failover_policy.status_classes",
+		"status_classes 是结构化切片，按仓库约定只走配置文件，不注册 SetDefault")
+}
+
+// TestFailoverPolicyStatusClassesDefaults 锁定规则表默认值（= design §3.3.2 默认表，
+// 等价于改造前 4 处硬编码状态码集合）。
+func TestFailoverPolicyStatusClassesDefaults(t *testing.T) {
+	resetViperWithJWTSecret(t)
+
+	cfg, err := Load()
+	require.NoError(t, err)
+
+	rules := cfg.Gateway.FailoverPolicy.StatusClasses
+	require.Len(t, rules, 10, "默认规则表一项一类")
+
+	type ruleWant struct {
+		class  string
+		codes  []int
+		ranges []string
+	}
+	want := []ruleWant{
+		{FailoverClassAuthInvalid, []int{401, 403}, nil},
+		{FailoverClassRateLimited, []int{429}, nil},
+		{FailoverClassQuotaExhausted, []int{529}, nil},
+		{FailoverClassCapacityShed, []int{503}, nil},
+		{FailoverClassUpstream5xx, []int{500, 502, 504}, []string{"500-599"}},
+		{FailoverClassUpstreamTimeout, nil, nil},
+		{FailoverClassNetwork, nil, nil},
+		{FailoverClassRequestInvalid, []int{400, 404, 409, 413, 422}, nil},
+		{FailoverClassPolicyBlocked, nil, nil},
+		{FailoverClassBindingPassthru, nil, nil},
+	}
+	for index, expected := range want {
+		require.Equal(t, expected.class, rules[index].Class, "第 %d 条规则的类别顺序是契约，不要重排", index)
+		require.Equal(t, expected.codes, rules[index].Codes)
+		require.Equal(t, expected.ranges, rules[index].Ranges)
+		require.Nil(t, rules[index].Advice, "默认表不带建议覆盖：处置建议归分类器的内置默认（= 现状）")
+	}
+
+	// 显式配置空数组 = 「一条规则都没有」，必须与「未配置（回落默认表）」区分。
+	t.Run("显式空数组不等于未配置", func(t *testing.T) {
+		resetViperWithJWTSecret(t)
+		viper.Set("gateway.failover_policy.status_classes", []FailoverStatusClassRuleConfig{})
+		explicit, err := Load()
+		require.NoError(t, err)
+		require.NotNil(t, explicit.Gateway.FailoverPolicy.StatusClasses)
+		require.Empty(t, explicit.Gateway.FailoverPolicy.StatusClasses)
+	})
+}
+
+func TestFailoverPolicyValidateRejectsInvalidValues(t *testing.T) {
+	cases := []struct {
+		name        string
+		mutate      func(*Config)
+		wantMessage string
+	}{
+		{
+			name:        "cooldown.fail_open=false 拒绝启动（fail-closed 会摘空账号池）",
+			mutate:      func(c *Config) { c.Gateway.FailoverPolicy.Cooldown.FailOpen = false },
+			wantMessage: "gateway.failover_policy.cooldown.fail_open",
+		},
+		{
+			name: "default_ttl 大于 max_ttl",
+			mutate: func(c *Config) {
+				c.Gateway.FailoverPolicy.Cooldown.DefaultTTL = 2 * time.Hour
+				c.Gateway.FailoverPolicy.Cooldown.MaxTTL = time.Hour
+			},
+			wantMessage: "gateway.failover_policy.cooldown.default_ttl",
+		},
+		{
+			name: "整请求预算小于单账号预算",
+			mutate: func(c *Config) {
+				c.Gateway.FailoverPolicy.Budget.TotalTimeout = 60 * time.Second
+				c.Gateway.FailoverPolicy.Budget.PerAccountTimeout = 90 * time.Second
+			},
+			wantMessage: "gateway.failover_policy.budget.total_timeout",
+		},
+		{
+			name:        "连续失败阈值为 0",
+			mutate:      func(c *Config) { c.Gateway.FailoverPolicy.Cooldown.ConsecutiveFailuresThreshold = 0 },
+			wantMessage: "gateway.failover_policy.cooldown.consecutive_failures_threshold",
+		},
+		{
+			name:        "首语义字节超时不在 30-600 内",
+			mutate:      func(c *Config) { c.Gateway.FailoverPolicy.FirstOutputTimeoutSeconds = 10 },
+			wantMessage: "gateway.failover_policy.first_output_timeout_seconds",
+		},
+		{
+			name:        "同账号重试模式非法",
+			mutate:      func(c *Config) { c.Gateway.FailoverPolicy.SameAccount.DefaultMode = "sometimes" },
+			wantMessage: "gateway.failover_policy.same_account.default_mode",
+		},
+		{
+			name:        "排除集清空次数超上限",
+			mutate:      func(c *Config) { c.Gateway.FailoverPolicy.MaxSelectionRetries = 9 },
+			wantMessage: "gateway.failover_policy.max_selection_retries",
+		},
+		{
+			name:        "Redis 超时过小",
+			mutate:      func(c *Config) { c.Gateway.FailoverPolicy.Cooldown.RedisTimeout = 10 * time.Millisecond },
+			wantMessage: "gateway.failover_policy.cooldown.redis_timeout",
+		},
+		{
+			name:        "上游总尝试次数超上限",
+			mutate:      func(c *Config) { c.Gateway.FailoverPolicy.Budget.MaxTotalUpstreamAttempts = 99 },
+			wantMessage: "gateway.failover_policy.budget.max_total_upstream_attempts",
+		},
+		{
+			name: "400 白名单条目超上限",
+			mutate: func(c *Config) {
+				keywords := make([]string, 65)
+				for i := range keywords {
+					keywords[i] = fmt.Sprintf("kw-%d", i)
+				}
+				c.Gateway.FailoverPolicy.Compat400Keywords = keywords
+			},
+			wantMessage: "gateway.failover_policy.compat_400_keywords",
+		},
+		{
+			name: "规则表状态码越界",
+			mutate: func(c *Config) {
+				c.Gateway.FailoverPolicy.StatusClasses = []FailoverStatusClassRuleConfig{
+					{Class: FailoverClassRequestInvalid, Codes: []int{99}},
+				}
+			},
+			wantMessage: "gateway.failover_policy.status_classes[0].codes",
+		},
+		{
+			name: "规则表码段非法",
+			mutate: func(c *Config) {
+				c.Gateway.FailoverPolicy.StatusClasses = []FailoverStatusClassRuleConfig{
+					{Class: FailoverClassUpstream5xx, Ranges: []string{"500-999"}},
+				}
+			},
+			wantMessage: "gateway.failover_policy.status_classes[0].ranges",
+		},
+		{
+			name: "规则表类别为空",
+			mutate: func(c *Config) {
+				c.Gateway.FailoverPolicy.StatusClasses = []FailoverStatusClassRuleConfig{{Codes: []int{500}}}
+			},
+			wantMessage: "gateway.failover_policy.status_classes[0].class",
+		},
+		{
+			name: "规则建议的作用域非法",
+			mutate: func(c *Config) {
+				scope := "world"
+				c.Gateway.FailoverPolicy.StatusClasses = []FailoverStatusClassRuleConfig{{
+					Class:  FailoverClassUpstream5xx,
+					Codes:  []int{500},
+					Advice: &FailoverRetryAdviceConfig{Scope: &scope},
+				}}
+			},
+			wantMessage: "gateway.failover_policy.status_classes[0].advice.scope",
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			resetViperWithJWTSecret(t)
+			cfg, err := Load()
+			require.NoError(t, err, "默认值本身必须合法")
+
+			tc.mutate(cfg)
+			err = cfg.Validate()
+
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "gateway.failover_policy.")
+			require.Contains(t, err.Error(), tc.wantMessage)
+		})
+	}
+}
+
+// TestFailoverPolicyLeavesExistingKeysUnchanged 守住 design §5.2「保留不变的现有键」：
+// 新增 failover_policy 不得改动既有扁平键的默认值或语义。
+func TestFailoverPolicyLeavesExistingKeysUnchanged(t *testing.T) {
+	resetViperWithJWTSecret(t)
+
+	cfg, err := Load()
+	require.NoError(t, err)
+
+	require.Equal(t, 10, cfg.Gateway.MaxAccountSwitches, "切换次数语义不变")
+	require.Equal(t, 3, cfg.Gateway.MaxAccountSwitchesGemini)
+	require.Equal(t, 4, cfg.Gateway.MaxSameAccountRetriesGemini)
+	require.False(t, cfg.Gateway.FailoverOn400, "旧键 gateway.failover_on_400 保持默认 false")
+	require.Equal(t, 600, cfg.Gateway.ResponseHeaderTimeout)
+	require.Equal(t, 0, cfg.Gateway.OpenAIFirstOutputTimeoutSeconds)
+
+	// 新键（同一语义的另一个入口）默认同样为 false：旧键与新键都为 false 时行为 = 现状。
+	require.False(t, cfg.Gateway.FailoverPolicy.FailoverOn400)
+}

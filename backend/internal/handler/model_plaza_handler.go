@@ -64,11 +64,22 @@ type modelPlazaTimePricing struct {
 }
 
 // modelPlazaModel 广场模型条目：实收口径展示定价（白名单形态）+ 官方参考价。
+//
+// 四类价格数据（design.md §4.3）：
+//   - catalog_pricing：模型目录价（管理员在「模型价格」页配置，未乘倍率）；未纳入目录时为 null；
+//   - discounted_pricing：折后价 = catalog_pricing × 生效分组倍率；未纳入目录时为 null；
+//   - pricing：实收单价（已按计费同源口径合成，仍未乘分组倍率）；
+//   - official_pricing：官方参考价（LiteLLM 口径，灰字对照）。
+//
+// peak_pricing 为模型级自定义高峰价（如有）。
 type modelPlazaModel struct {
-	Name            string                     `json:"name"`
-	Platform        string                     `json:"platform"`
-	Pricing         *userSupportedModelPricing `json:"pricing"`
-	OfficialPricing *modelPlazaOfficialPricing `json:"official_pricing"`
+	Name              string                     `json:"name"`
+	Platform          string                     `json:"platform"`
+	CatalogPricing    *userSupportedModelPricing `json:"catalog_pricing"`
+	Pricing           *userSupportedModelPricing `json:"pricing"`
+	DiscountedPricing *userSupportedModelPricing `json:"discounted_pricing"`
+	PeakPricing       *modelPlazaOfficialPricing `json:"peak_pricing"`
+	OfficialPricing   *modelPlazaOfficialPricing `json:"official_pricing"`
 	// LongContextBasis 多档时的计价基准："whole_request"（整单按档）| "marginal"（仅超出部分）。
 	LongContextBasis string `json:"long_context_basis,omitempty"`
 	// TimePricing 分时倍率时段，落在时段内的请求整单乘倍率；无分时省略。
@@ -96,8 +107,10 @@ type modelPlazaGroup struct {
 	VideoRateIndependent bool    `json:"video_rate_independent"`
 	VideoRateMultiplier  float64 `json:"video_rate_multiplier"`
 	// 分组是否启用长上下文阶梯计费；关闭时模型实付列只展示最低档/基础价。
-	LongContextPricingEnabled bool              `json:"long_context_pricing_enabled"`
-	Models                    []modelPlazaModel `json:"models"`
+	LongContextPricingEnabled bool `json:"long_context_pricing_enabled"`
+	// CatalogModelCount 本分组中价格来自模型目录价的模型数（未纳入目录价的不计入）。
+	CatalogModelCount int               `json:"catalog_model_count"`
+	Models            []modelPlazaModel `json:"models"`
 }
 
 // modelPlazaResponse 广场页响应。
@@ -199,16 +212,30 @@ func toLocalizedModelPlazaGroups(visible []service.PlazaGroup, userRates map[int
 
 // toModelPlazaGroupDTO 将 service 层广场分组映射为白名单 DTO,并合并用户专属倍率。
 func toModelPlazaGroupDTO(g *service.PlazaGroup, userRates map[int64]float64) modelPlazaGroup {
+	var userRate *float64
+	if rate, ok := userRates[g.ID]; ok {
+		userRate = &rate
+	}
 	models := make([]modelPlazaModel, 0, len(g.Models))
 	for i := range g.Models {
 		m := &g.Models[i]
+		// 折后价按生效倍率（用户专属倍率优先）重算，覆盖 service 层用分组默认倍率
+		// 预计算的值，避免登录用户看到与实付不一致的折后价。
+		discounted := m.DiscountedPricing
+		if m.Pricing != nil {
+			rate := service.PlazaGroupEffectiveRate(g, plazaBillingMode(m.Pricing), userRate)
+			discounted = service.PlazaDiscountedPricing(m.Pricing, rate)
+		}
 		models = append(models, modelPlazaModel{
-			Name:             m.Name,
-			Platform:         m.Platform,
-			Pricing:          toUserPricing(m.Pricing),
-			OfficialPricing:  toModelPlazaOfficialPricing(m.OfficialPricing),
-			LongContextBasis: string(m.LongContextBasis),
-			TimePricing:      toModelPlazaTimePricing(m.TimePricing),
+			Name:              m.Name,
+			Platform:          m.Platform,
+			CatalogPricing:    toUserPricing(m.CatalogPricing),
+			Pricing:           toUserPricing(m.Pricing),
+			DiscountedPricing: toUserPricing(discounted),
+			PeakPricing:       toModelPlazaOfficialPricing(m.PeakPricing),
+			OfficialPricing:   toModelPlazaOfficialPricing(m.OfficialPricing),
+			LongContextBasis:  string(m.LongContextBasis),
+			TimePricing:       toModelPlazaTimePricing(m.TimePricing),
 		})
 	}
 	dto := modelPlazaGroup{
@@ -218,6 +245,7 @@ func toModelPlazaGroupDTO(g *service.PlazaGroup, userRates map[int64]float64) mo
 		Platform:                  g.Platform,
 		SubscriptionType:          g.SubscriptionType,
 		RateMultiplier:            g.RateMultiplier,
+		UserRateMultiplier:        userRate,
 		PeakRateEnabled:           g.PeakRateEnabled,
 		PeakStart:                 g.PeakStart,
 		PeakEnd:                   g.PeakEnd,
@@ -228,12 +256,19 @@ func toModelPlazaGroupDTO(g *service.PlazaGroup, userRates map[int64]float64) mo
 		VideoRateIndependent:      g.VideoRateIndependent,
 		VideoRateMultiplier:       g.VideoRateMultiplier,
 		LongContextPricingEnabled: g.LongContextPricingEnabled,
+		CatalogModelCount:         g.CatalogModelCount,
 		Models:                    models,
 	}
-	if rate, ok := userRates[g.ID]; ok {
-		dto.UserRateMultiplier = &rate
-	}
 	return dto
+}
+
+// plazaBillingMode 返回展示定价的计费模式（空值按 token 处理），
+// 供折后价按图片/视频独立倍率口径折算。
+func plazaBillingMode(p *service.ChannelModelPricing) service.BillingMode {
+	if p == nil || p.BillingMode == "" {
+		return service.BillingModeToken
+	}
+	return p.BillingMode
 }
 
 // toModelPlazaTimePricing 转换分时倍率；nil 透传（JSON 省略）。

@@ -40,6 +40,7 @@ var gatewayCompatibilityMetricsLogCounter atomic.Uint64
 
 // GatewayHandler handles API gateway requests
 type GatewayHandler struct {
+	upstreamCostRecorder      *service.UpstreamCostAttemptRecorder
 	gatewayService            *service.GatewayService
 	openAIGatewayService      *service.OpenAIGatewayService
 	geminiCompatService       *service.GeminiMessagesCompatService
@@ -123,6 +124,8 @@ func NewGatewayHandler(
 // Messages handles Claude API compatible messages endpoint
 // POST /v1/messages
 func (h *GatewayHandler) Messages(c *gin.Context) {
+	installCostAttemptAudit(c, h.upstreamCostRecorder)
+	defer finishFailoverObservation(c)
 	// 从context获取apiKey和user（ApiKeyAuth中间件已设置）
 	apiKey, ok := middleware2.GetAPIKeyFromContext(c)
 	if !ok {
@@ -135,6 +138,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 		h.errorResponse(c, http.StatusInternalServerError, "api_error", "User context not found")
 		return
 	}
+	defer h.installFailoverRouting(c)()
 	reqLog := requestLogger(
 		c,
 		"handler.gateway.messages",
@@ -160,6 +164,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 		return
 	}
 
+	captureFailoverIdempotencyInput(c, body)
 	setOpsRequestContext(c, "", false)
 
 	bodyRef := service.NewRequestBodyRef(body)
@@ -341,14 +346,14 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 	hasBoundSession := sessionKey != "" && sessionBoundAccountID > 0
 
 	if platform == service.PlatformGemini {
-		fs := NewFailoverState(h.maxAccountSwitchesGemini, hasBoundSession)
+		fs := h.newGroupFailoverState(c, apiKey.GroupID, h.maxAccountSwitchesGemini, hasBoundSession)
 
 		// 单账号分组首次 503 就不设模型限流标记，避免设 29s 限流导致后续请求连续快速失败；
 		// 是否单账号分组在 antigravity 账号遇到 503 或模型限流预检查时才判定。
 		c.Request = c.Request.WithContext(h.gatewayService.WithSingleAntigravityAccountGroupProbe(c.Request.Context(), apiKey.GroupID))
 
 		for {
-			selection, err := h.gatewayService.SelectAccountWithLoadAwareness(c.Request.Context(), apiKey.GroupID, sessionKey, reqModel, fs.FailedAccountIDs, "", int64(0)) // Gemini 不使用会话限制
+			selection, err := fs.selectGatewayAccount(c.Request.Context(), h.gatewayService, apiKey.GroupID, sessionKey, reqModel, fs.selectionExclusions(), "", int64(0)) // Gemini 不使用会话限制
 			if err != nil {
 				if failoverClientGone(c) {
 					reqLog.Info("gateway.account_select_aborted_client_disconnected", zap.Error(err))
@@ -383,13 +388,21 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 					failoverClientGone(c)
 					return
 				default: // FailoverExhausted
+					if fs.Outcome != nil {
+						h.handleFailoverBudgetExhausted(c, fs.Outcome, streamStarted)
+						return
+					}
 					if fs.LastFailoverErr != nil {
-						h.handleFailoverExhausted(c, fs.LastFailoverErr, service.PlatformGemini, streamStarted)
+						h.handleFailoverStateExhausted(c, fs, service.PlatformGemini, streamStarted)
 					} else {
 						h.handleFailoverExhaustedSimple(c, 502, streamStarted)
 					}
 					return
 				}
+			}
+			if fs.rejectIdempotencyRetrySelection(c.Request.Context(), selection) {
+				h.handleFailoverStateExhausted(c, fs, selection.Account.Platform, streamStarted)
+				return
 			}
 			account := selection.Account
 			setOpsSelectedAccount(c, account.ID, account.Platform)
@@ -480,6 +493,10 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			}
 			account = latest
 			selection.Account = latest
+			if !fs.admitIsolation(admissionCtx, selection, accountReleaseFunc) {
+				h.gatewayService.ReleaseAccountSession(context.WithoutCancel(admissionCtx), account, sessionKey)
+				continue
+			}
 			// 等待路径保持既有 eager 绑定（无门时 helper 直接绑定）；调度器已
 			// 抢槽的直达路径无门时由选号内部绑定，这里只在门下补准入后绑定。
 			if selection.ProfitGateActive() || !selection.Acquired {
@@ -492,12 +509,19 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 
 			// 转发请求 - 根据账号平台分流
 			var result *service.ForwardResult
-			requestCtx := c.Request.Context()
+			requestCtx := gatewayFailoverForwardContext(c)
 			if fs.SwitchCount > 0 {
 				requestCtx = service.WithAccountSwitchCount(requestCtx, fs.SwitchCount, h.metadataBridgeEnabled())
 			}
-			// 记录 Forward 前已写入字节数，Forward 后若增加则说明 SSE 内容已发，禁止 failover
+			// P2/T2.2（R-17）：门控开启时安装「延迟副作用」收集器 —— service 不再就地
+			// 标记账号，由本函数在确认换号后执行、放弃换号时抑制。门控默认关闭（= 现状）。
+
+			// 记录 Forward 前已写入字节数（旧判据基线，仅在 use_semantic_bytes=false 时生效）
 			writerSizeBeforeForward := c.Writer.Size()
+			// P2/T2.1：本次尝试的写状态基线（ping 等心跳字节不阻止换号，R-01）。
+			writeAttempt := service.BeginUpstreamWriteAttempt(c, fs.useSemanticBytes(h.useSemanticBytes()))
+			fs.observeForward(c, account, apiKey.GroupID, reqModel)
+			requestCtx, finishBudget := fs.beginForward(requestCtx, c, reqStream, h.failoverResponseHeaderTimeout())
 			if account.Platform == service.PlatformAntigravity {
 				result, err = h.antigravityGatewayService.ForwardGemini(
 					requestCtx,
@@ -513,23 +537,56 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			} else {
 				result, err = h.geminiCompatService.Forward(requestCtx, c, account, body)
 			}
+			if h.upstreamCostRecorder != nil {
+				recordGatewayForwardCost(c, result, err)
+			}
+
+			budgetErr := finishBudget()
+			gatewayIsolationFrom(c.Request.Context()).recordForward(c.Request.Context(), result, fs.applyForwardBudgetError(err, budgetErr), gatewayIsolationCanSwitch(writeAttempt))
 			if accountReleaseFunc != nil {
 				accountReleaseFunc()
 			}
+			if budgetErr != nil && failoverClientGone(c) {
+				return
+			}
+			if errors.Is(budgetErr, errFailoverBudget) {
+				suppressTerminalFailoverSideEffects(c, account.ID)
+				fs.exhaustBudget(c.Request.Context(), account.ID)
+				h.handleFailoverBudgetExhausted(c, fs.Outcome, streamStarted)
+				return
+			}
+			err = fs.applyForwardBudgetError(err, budgetErr)
 			if err != nil {
 				var failoverErr *service.UpstreamFailoverError
 				if errors.As(err, &failoverErr) {
-					// 流式内容已写入客户端，无法撤销，禁止 failover 以防止流拼接腐化
-					if c.Writer.Size() != writerSizeBeforeForward {
+					// P2/T2.1（R-01）：判据统一走 service 的写状态对象。旧写法用 `Size()`
+					// 增量，把排队期写出的 ping 也算成「已写内容」，导致 ping 之后换号
+					// 永久失效；现在只有**语义字节**才阻止换号。
+					if blocked, reason := service.FailoverBlockedForAttempt(writeAttempt); blocked {
+						// P2/T2.2（R-17）：放弃换号 → 一并抑制 service 已挂起的账号标记，
+						// 让「判定」与「副作用」同源。
+						service.SuppressFailoverSideEffectsForRequest(c, account.ID, reason)
+						markFailoverSuppressed(c, string(reason), failoverErr.StatusCode)
+						reqLog.Warn("gateway.failover_suppressed",
+							zap.String("reason", string(reason)),
+							zap.Int64("account_id", account.ID),
+							zap.String("platform", service.PlatformGemini),
+							zap.Int("status_code", failoverErr.StatusCode),
+						)
 						h.handleFailoverExhausted(c, failoverErr, service.PlatformGemini, true)
 						return
 					}
+					switchesBefore := fs.SwitchCount
 					action := fs.HandleFailoverError(c.Request.Context(), h.gatewayService, account.ID, account.Platform, account.GetPoolModeRetryCount(), failoverErr)
 					switch action {
 					case FailoverContinue:
+						if fs.SwitchCount > switchesBefore {
+							h.stageStickyClearance(c.Request.Context(), account.ID, reqLog, failoverErr, apiKey.GroupID, sessionKey, fs.SameAccountRetryCount[account.ID] > 0)
+						}
 						continue
 					case FailoverExhausted:
-						h.handleFailoverExhausted(c, fs.LastFailoverErr, service.PlatformGemini, streamStarted)
+						suppressTerminalFailoverSideEffects(c, account.ID)
+						h.handleFailoverStateExhausted(c, fs, service.PlatformGemini, streamStarted)
 						return
 					case FailoverCanceled:
 						failoverClientGone(c)
@@ -662,8 +719,13 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 		}
 	}()
 
+	var requestBudget *FailoverBudget
 	for {
-		fs := NewFailoverState(h.maxAccountSwitches, hasBoundSession)
+		fs := h.newGroupFailoverState(c, currentAPIKey.GroupID, h.maxAccountSwitches, hasBoundSession)
+		if requestBudget == nil {
+			requestBudget = fs.Budget
+		}
+		fs.Budget = requestBudget
 		retryWithFallback := false
 
 		for {
@@ -680,7 +742,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 				zap.Bool("has_bound_session", hasBoundSession),
 				zap.Int("failed_account_count", len(fs.FailedAccountIDs)),
 			)
-			selection, err := h.gatewayService.SelectAccountWithLoadAwareness(c.Request.Context(), currentAPIKey.GroupID, sessionKey, reqModel, fs.FailedAccountIDs, parsedReq.MetadataUserID, subject.UserID)
+			selection, err := fs.selectGatewayAccount(c.Request.Context(), h.gatewayService, currentAPIKey.GroupID, sessionKey, reqModel, fs.selectionExclusions(), parsedReq.MetadataUserID, subject.UserID)
 			if err != nil {
 				if failoverClientGone(c) {
 					reqLog.Info("gateway.account_select_aborted_client_disconnected", zap.Error(err))
@@ -716,6 +778,10 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 					failoverClientGone(c)
 					return
 				default: // FailoverExhausted
+					if fs.Outcome != nil {
+						h.handleFailoverBudgetExhausted(c, fs.Outcome, streamStarted)
+						return
+					}
 					if fs.LastFailoverErr != nil {
 						h.handleFailoverExhausted(c, fs.LastFailoverErr, platform, streamStarted)
 					} else {
@@ -723,6 +789,10 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 					}
 					return
 				}
+			}
+			if fs.rejectIdempotencyRetrySelection(c.Request.Context(), selection) {
+				h.handleFailoverStateExhausted(c, fs, selection.Account.Platform, streamStarted)
+				return
 			}
 			account := selection.Account
 			setOpsSelectedAccount(c, account.ID, account.Platform)
@@ -826,6 +896,10 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			}
 			account = latest
 			selection.Account = latest
+			if !fs.admitIsolation(admissionCtx, selection, accountReleaseFunc) {
+				h.gatewayService.ReleaseAccountSession(context.WithoutCancel(admissionCtx), account, sessionKey)
+				continue
+			}
 			// 记录本请求注册过会话槽的账号（profit 准入后账号已定）
 			sessionSlotAccounts[account.ID] = account
 			// 等待路径保持既有 eager 绑定（无门时 helper 直接绑定）；调度器已
@@ -894,12 +968,24 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			if channelMapping.Mapped {
 				attemptParsedReq.Model = channelMapping.MappedModel
 				if err := attemptParsedReq.ReplaceBody(h.gatewayService.ReplaceModelInBody(attemptParsedReq.Body.Bytes(), channelMapping.MappedModel)); err != nil {
+					if queueRelease != nil {
+						queueRelease()
+					}
+					if accountReleaseFunc != nil {
+						accountReleaseFunc()
+					}
 					h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
 					return
 				}
 			}
 			// Bedrock CC 兼容：清理 body 专有字段 + 过滤 anthropic-beta header，适用于所有转发路径
 			if err := attemptParsedReq.ReplaceBody(h.gatewayService.ApplyBedrockCCCompat(c, attemptParsedReq.Body.Bytes(), attemptParsedReq.Model, account, apiKey.GroupID)); err != nil {
+				if queueRelease != nil {
+					queueRelease()
+				}
+				if accountReleaseFunc != nil {
+					accountReleaseFunc()
+				}
 				h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
 				return
 			}
@@ -908,20 +994,32 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			// 转发请求 - 根据账号平台分流
 			c.Set("parsed_request", attemptParsedReq)
 			var result *service.ForwardResult
-			requestCtx := c.Request.Context()
+			requestCtx := gatewayFailoverForwardContext(c)
 			if fs.SwitchCount > 0 {
 				requestCtx = service.WithAccountSwitchCount(requestCtx, fs.SwitchCount, h.metadataBridgeEnabled())
 			}
 			if fs.ForceCacheBilling {
 				requestCtx = service.WithForceCacheBilling(requestCtx)
 			}
-			// 记录 Forward 前已写入字节数，Forward 后若增加则说明 SSE 内容已发，禁止 failover
+			// P2/T2.2（R-17）：门控开启时安装「延迟副作用」收集器（默认关闭 = 现状）。
+
+			// 记录 Forward 前已写入字节数（旧判据基线，仅在 use_semantic_bytes=false 时生效）
 			writerSizeBeforeForward := c.Writer.Size()
+			// P2/T2.1：本次尝试的写状态基线（ping 等心跳字节不阻止换号，R-01）。
+			writeAttempt := service.BeginUpstreamWriteAttempt(c, fs.useSemanticBytes(h.useSemanticBytes()))
+			fs.observeForward(c, account, currentAPIKey.GroupID, reqModel)
+			requestCtx, finishBudget := fs.beginForward(requestCtx, c, reqStream, h.failoverResponseHeaderTimeout())
 			if account.Platform == service.PlatformAntigravity && account.Type != service.AccountTypeAPIKey {
 				result, err = h.antigravityGatewayService.Forward(requestCtx, c, account, attemptBody, hasBoundSession)
 			} else {
 				result, err = h.gatewayService.Forward(requestCtx, c, account, attemptParsedReq)
 			}
+			if h.upstreamCostRecorder != nil {
+				recordGatewayForwardCost(c, result, err)
+			}
+
+			budgetErr := finishBudget()
+			gatewayIsolationFrom(c.Request.Context()).recordForward(c.Request.Context(), result, fs.applyForwardBudgetError(err, budgetErr), gatewayIsolationCanSwitch(writeAttempt))
 
 			// 兜底释放串行锁（正常情况已通过回调提前释放）
 			if queueRelease != nil {
@@ -995,6 +1093,16 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 				})
 			}
 
+			if budgetErr != nil && failoverClientGone(c) {
+				return
+			}
+			if errors.Is(budgetErr, errFailoverBudget) {
+				suppressTerminalFailoverSideEffects(c, account.ID)
+				fs.exhaustBudget(c.Request.Context(), account.ID)
+				h.handleFailoverBudgetExhausted(c, fs.Outcome, streamStarted)
+				return
+			}
+			err = fs.applyForwardBudgetError(err, budgetErr)
 			if err != nil {
 				// Beta policy block: return 400 immediately, no failover
 				var betaBlockedErr *service.BetaBlockedError
@@ -1038,6 +1146,10 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 							h.handleStreamingAwareError(c, status, code, message, streamStarted)
 							return
 						}
+						if fs.denyIdempotencySwitch(c.Request.Context(), account.ID, promptTooLongErr.StatusCode) {
+							_ = h.antigravityGatewayService.WriteMappedClaudeError(c, account, promptTooLongErr.StatusCode, promptTooLongErr.RequestID, promptTooLongErr.Body)
+							return
+						}
 						// 兜底重试按"直接请求兜底分组"处理：清除强制平台，允许按分组平台调度
 						ctx := context.WithValue(c.Request.Context(), ctxkey.ForcePlatform, "")
 						c.Request = c.Request.WithContext(ctx)
@@ -1057,20 +1169,34 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 				}
 				var failoverErr *service.UpstreamFailoverError
 				if errors.As(err, &failoverErr) {
-					// 流式内容已写入客户端，无法撤销，禁止 failover 以防止流拼接腐化
-					if c.Writer.Size() != writerSizeBeforeForward {
+					// P2/T2.1（R-01）：判据统一走 service 的写状态对象（见 Gemini 路径注释）。
+					if blocked, reason := service.FailoverBlockedForAttempt(writeAttempt); blocked {
+						// P2/T2.2（R-17）：放弃换号 → 抑制 service 已挂起的账号标记。
+						service.SuppressFailoverSideEffectsForRequest(c, account.ID, reason)
+						markFailoverSuppressed(c, string(reason), failoverErr.StatusCode)
+						reqLog.Warn("gateway.failover_suppressed",
+							zap.String("reason", string(reason)),
+							zap.Int64("account_id", account.ID),
+							zap.String("platform", account.Platform),
+							zap.Int("status_code", failoverErr.StatusCode),
+						)
 						h.handleFailoverExhausted(c, failoverErr, account.Platform, true)
 						return
 					}
+					switchesBefore := fs.SwitchCount
 					action := fs.HandleFailoverError(c.Request.Context(), h.gatewayService, account.ID, account.Platform, account.GetPoolModeRetryCount(), failoverErr)
 					switch action {
 					case FailoverContinue:
+						if fs.SwitchCount > switchesBefore {
+							h.stageStickyClearance(c.Request.Context(), account.ID, reqLog, failoverErr, currentAPIKey.GroupID, sessionKey, fs.SameAccountRetryCount[account.ID] > 0)
+						}
 						// 本次尝试已确定性失败，立即释放该账号的会话注册
 						h.gatewayService.ReleaseAccountSession(context.Background(), account, sessionKey)
 						delete(sessionSlotAccounts, account.ID)
 						continue
 					case FailoverExhausted:
-						h.handleFailoverExhausted(c, fs.LastFailoverErr, account.Platform, streamStarted)
+						suppressTerminalFailoverSideEffects(c, account.ID)
+						h.handleFailoverStateExhausted(c, fs, account.Platform, streamStarted)
 						return
 					case FailoverCanceled:
 						failoverClientGone(c)
@@ -1919,7 +2045,15 @@ func (h *GatewayHandler) handleConcurrencyError(c *gin.Context, err error, slotT
 }
 
 func (h *GatewayHandler) handleFailoverExhausted(c *gin.Context, failoverErr *service.UpstreamFailoverError, platform string, streamStarted bool) {
-	statusCode := failoverErr.StatusCode
+	statusCode := 0
+	if failoverErr != nil {
+		statusCode = failoverErr.StatusCode
+	}
+	prepareFailoverTerminal(c, statusCode, "accounts", h.cfg)
+	if failoverErr == nil {
+		h.handleFailoverExhaustedSimple(c, statusCode, streamStarted)
+		return
+	}
 	responseBody := failoverErr.ResponseBody
 	if service.IsOpenAISilentRefusalErrorBody(responseBody) {
 		service.SetOpsUpstreamError(c, statusCode, service.OpenAISilentRefusalClientMessage(), "")
@@ -1957,11 +2091,52 @@ func (h *GatewayHandler) handleFailoverExhausted(c *gin.Context, failoverErr *se
 
 	// 使用默认的错误映射
 	status, errType, errMsg := h.mapUpstreamError(statusCode)
+	if mixedFailoverStatus(c, h.cfg) {
+		status, errType, errMsg = http.StatusServiceUnavailable, "overloaded_error", "Upstream service temporarily unavailable"
+	}
 	h.handleStreamingAwareError(c, status, errType, errMsg, streamStarted)
+}
+
+const failoverBudgetExhaustedMessage = "Upstream failover budget exhausted"
+const failoverOutcomeContextKey = "gateway.failover.outcome"
+
+// recordFailoverOutcome leaves a typed result for P5; only the reason is
+// currently surfaced, and only while the response headers remain writable.
+func recordFailoverOutcome(c *gin.Context, outcome *FailoverOutcomeError) {
+	setFailoverTerminal(c, *outcome)
+	if !c.Writer.Written() {
+		c.Header("X-Failover-Reason", outcome.Reason)
+	}
+	service.SetOpsUpstreamError(c, outcome.LastStatus, failoverBudgetExhaustedMessage, "")
+}
+
+func (h *GatewayHandler) handleFailoverStateExhausted(c *gin.Context, fs *FailoverState, platform string, streamStarted bool) {
+	if fs.Outcome != nil {
+		h.handleFailoverBudgetExhausted(c, fs.Outcome, streamStarted)
+		return
+	}
+	h.handleFailoverExhausted(c, fs.LastFailoverErr, platform, streamStarted)
+}
+
+func (h *GatewayHandler) failoverResponseHeaderTimeout() time.Duration {
+	if h.cfg == nil {
+		return 0
+	}
+	return time.Duration(h.cfg.Gateway.ResponseHeaderTimeout) * time.Second
+}
+
+func (h *GatewayHandler) handleFailoverBudgetExhausted(c *gin.Context, outcome *FailoverOutcomeError, streamStarted bool) {
+	recordFailoverOutcome(c, outcome)
+	status, errType, _ := h.mapUpstreamError(outcome.LastStatus)
+	if outcome.LastStatus == 0 {
+		status = http.StatusGatewayTimeout
+	}
+	h.handleStreamingAwareError(c, status, errType, failoverBudgetExhaustedMessage, streamStarted || c.Writer.Written())
 }
 
 // handleFailoverExhaustedSimple 简化版本，用于没有响应体的情况
 func (h *GatewayHandler) handleFailoverExhaustedSimple(c *gin.Context, statusCode int, streamStarted bool) {
+	prepareFailoverTerminal(c, statusCode, "accounts", h.cfg)
 	status, errType, errMsg := h.mapUpstreamError(statusCode)
 	service.SetOpsUpstreamError(c, statusCode, errMsg, "")
 	h.handleStreamingAwareError(c, status, errType, errMsg, streamStarted)
@@ -1991,6 +2166,13 @@ func (h *GatewayHandler) handleStreamingAwareError(c *gin.Context, status int, e
 
 func (h *GatewayHandler) handleStreamingAwareErrorWithCode(c *gin.Context, status int, errType, code, message string, streamStarted bool) {
 	if streamStarted {
+		_, terminal := c.Get(failoverOutcomeContextKey)
+		if terminal && service.IsResponseCommitted(c) {
+			return
+		}
+		if terminal {
+			service.MarkResponseCommitted(c)
+		}
 		// 响应状态码已固化为 200（ping/部分数据已 flush），错误只能就地以 SSE 帧回传。
 		// 标记本次流内错误，供 ops_error_logger 补记——否则该中间件按 status>=400 采集，
 		// 这类挂在 200 流上的失败（如并发限流回退）不会进错误看板。
@@ -2013,6 +2195,18 @@ func (h *GatewayHandler) handleStreamingAwareErrorWithCode(c *gin.Context, statu
 				errorCode = `,"code":` + strconv.Quote(code)
 			}
 			errorEvent := `data: {"type":"error","error":{"type":` + strconv.Quote(errType) + errorCode + `,"message":` + strconv.Quote(message) + `}}` + "\n\n"
+			if terminal {
+				errorObject := gin.H{"type": errType, "message": message}
+				if code != "" {
+					errorObject["code"] = code
+				}
+				addFailoverTerminalFields(c, errorObject)
+				payload, _ := json.Marshal(gin.H{"type": "error", "error": errorObject})
+				errorEvent = "event: error\ndata: " + string(payload) + "\n\n"
+				if c.Request != nil && strings.HasSuffix(c.Request.URL.Path, "/messages") {
+					errorEvent += "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+				}
+			}
 			if _, err := fmt.Fprint(c.Writer, errorEvent); err != nil {
 				_ = c.Error(err)
 			}
@@ -2046,6 +2240,151 @@ func (h *GatewayHandler) ensureForwardErrorResponse(c *gin.Context, streamStarte
 	}
 	h.handleStreamingAwareError(c, http.StatusBadGateway, "upstream_error", "Upstream request failed", streamStarted)
 	return true
+}
+
+func (h *GatewayHandler) installFailoverRouting(c *gin.Context) func() {
+	installDeferredFailoverSideEffects(c)
+	ctx := h.gatewayService.WithFailoverRouting(c.Request.Context())
+	var isolation *gatewayIsolationRequest
+	if machine := h.gatewayService.FailoverIsolation(); machine != nil && service.FailoverRequestPolicyFromContext(ctx) != nil {
+		isolation = &gatewayIsolationRequest{machine: machine, failed: make(map[int64]struct{}),
+			writes: make(map[int64]service.FailoverIsolationFailure), switched: make(map[int64]bool)}
+		ctx = context.WithValue(ctx, gatewayIsolationKey{}, isolation)
+	}
+	c.Request = c.Request.WithContext(ctx)
+	return func() { isolation.finish(c.Request.Context()) }
+}
+
+func (h *GatewayHandler) newGroupFailoverState(c *gin.Context, groupID *int64, maxSwitches int, bound bool) *FailoverState {
+	state := h.newFailoverState(maxSwitches, bound)
+	ctx, policy, source := h.gatewayService.ResolveFailoverRoutingPolicy(c.Request.Context(), groupID)
+	c.Request = c.Request.WithContext(ctx)
+	if policy != nil {
+		state.policySource = source
+		state.effectivePolicy = policy
+		if !policy.Legacy() {
+			if policy.MaxAccountSwitches != nil {
+				state.MaxSwitches = *policy.MaxAccountSwitches
+			}
+			if policy.MaxSelectionRetries != nil {
+				state.maxSelectionRetries = *policy.MaxSelectionRetries
+			}
+			state.Budget = newResolvedFailoverBudget(policy)
+			state.jitterEnabled = true
+		} else {
+			state.Budget = nil
+			state.maxSelectionRetries = 0
+			state.jitterEnabled = false
+		}
+	}
+	input, captured := c.Request.Context().Value(failoverIdempotencyInputKey{}).(failoverIdempotencyInput)
+	if captured {
+		var gate service.FailoverIdempotencyGate
+		if policy != nil {
+			gate = service.NewFailoverIdempotencyGateFromPolicy(*policy)
+		} else if h.cfg != nil {
+			gate = service.NewFailoverIdempotencyGate(h.cfg.Gateway.FailoverPolicy.Idempotency)
+		}
+		if gate.Enabled() {
+			state.idempotency = &failoverIdempotencyCheck{input: input, evaluator: gate}
+		}
+	}
+	return state
+}
+
+func (h *GatewayHandler) newFailoverState(maxSwitches int, hasBoundSession bool) *FailoverState {
+	state := NewFailoverState(maxSwitches, hasBoundSession)
+	if h.cfg != nil && h.cfg.Gateway.FailoverPolicy.Enabled {
+		state.Budget = newFailoverBudget(h.cfg.Gateway.FailoverPolicy)
+		state.maxSelectionRetries = h.cfg.Gateway.FailoverPolicy.MaxSelectionRetries
+		state.jitterEnabled = true
+	}
+	return state
+}
+
+// useSemanticBytes 报告换号判据是否使用「语义字节」（B1，配置默认 true）。
+//
+// false 时回到改造前的「任何字节都不许换号」（连 ping 都算已写内容），用于回滚。
+func (h *GatewayHandler) useSemanticBytes() bool {
+	if h == nil {
+		return true
+	}
+	return service.UseSemanticBytesFor(h.cfg)
+}
+
+// installDeferredFailoverSideEffects 在副作用门控开启时为本次请求安装收集器。
+//
+// 门控默认关闭：此时什么都不做，service 会像改造前一样就地标记账号（零行为变更）。
+// 开启后 service 只把「该怎么标记」挂起，由 handler 在确认换号后 Apply、
+// 放弃换号时 Suppress（R-17：判定与副作用同源）。
+func gatewayFailoverForwardContext(c *gin.Context) context.Context {
+	installDeferredFailoverSideEffects(c)
+	return c.Request.Context()
+}
+
+func installDeferredFailoverSideEffects(c *gin.Context) {
+	if c == nil || c.Request == nil {
+		return
+	}
+	service.InstallHTTPFailoverMutationSink(c)
+}
+
+// clearStickyOnAccountFailure 读取 B2 配置（switch_order.clear_sticky_on_account_failure）。
+func (h *GatewayHandler) clearStickyOnAccountFailure() bool {
+	if h == nil || h.cfg == nil {
+		return true
+	}
+	return h.cfg.Gateway.FailoverPolicy.SwitchOrder.ClearStickyOnAccountFailure
+}
+
+// applyStickyClearance 按失败分档决定是否删除粘性绑定（P2/T2.3，B2）。
+//
+// 分档依据见 service.ShouldClearStickyBinding：account 级失败删、瞬时/provider/request/
+// 绑定透传保留。**默认（门控关）不动绑定**，与改造前完全一致；「保留」也留一条日志，
+// 让「被抑制的清除」可观测（R-45/R-44 要求的可见性）。
+func (h *GatewayHandler) stageStickyClearance(ctx context.Context, accountID int64, reqLog *zap.Logger, failoverErr *service.UpstreamFailoverError, groupID *int64, sessionKey string, sameAccountRetried bool) {
+	groupID = service.ResolvedGatewayFailoverGroupID(ctx, groupID)
+	apply := func(writeCtx context.Context) {
+		h.applyStickyClearance(writeCtx, reqLog, failoverErr, groupID, sessionKey, sameAccountRetried)
+	}
+	if !service.DeferFailoverMutation(ctx, accountID, "sticky", func(writeCtx context.Context) {
+		apply(service.ContextWithResolvedGatewayFailoverPolicy(writeCtx, ctx))
+	}) {
+		apply(ctx)
+	}
+}
+
+func (h *GatewayHandler) applyStickyClearance(ctx context.Context, reqLog *zap.Logger, failoverErr *service.UpstreamFailoverError, groupID *int64, sessionKey string, sameAccountRetried bool) {
+	if h == nil || h.gatewayService == nil || failoverErr == nil || sessionKey == "" || ctx.Err() != nil {
+		return
+	}
+	enabled := h.clearStickyOnAccountFailure()
+	if policy, _ := service.ResolvedGatewayFailoverPolicy(ctx); !policy.Legacy() && policy.SwitchOrderClearStickyOnAccountFailure != nil {
+		enabled = *policy.SwitchOrderClearStickyOnAccountFailure
+	}
+	groupID = service.ResolvedGatewayFailoverGroupID(ctx, groupID)
+	clear, reason := service.ShouldClearStickyBinding(service.StickyClearanceInput{
+		GateOn:                   service.FailoverDecisionGateEnabled(),
+		ConfigEnabled:            enabled,
+		HasBoundSession:          sessionKey != "",
+		Scope:                    failoverErr.Scope,
+		RequestScopedTransient:   failoverErr.RequestScopedTransient,
+		BoundUpstreamPassthrough: failoverErr.BoundUpstreamPassthrough,
+		RetryableOnSameAccount:   failoverErr.RetryableOnSameAccount,
+		SameAccountRetried:       sameAccountRetried,
+	})
+	fields := []zap.Field{
+		zap.String("reason", reason),
+		zap.Bool("cleared", clear),
+		zap.Int("upstream_status", failoverErr.StatusCode),
+		zap.String("scope", string(failoverErr.Scope)),
+	}
+	if clear {
+		h.gatewayService.ClearStickySessionBinding(context.Background(), groupID, sessionKey)
+	}
+	if reqLog != nil {
+		reqLog.Info("gateway.sticky_clearance", fields...)
+	}
 }
 
 // gatewayForwardErrorAlreadyCommunicated reports whether a Forward implementation
@@ -2124,6 +2463,7 @@ func (h *GatewayHandler) errorResponse(c *gin.Context, status int, errType, mess
 
 func (h *GatewayHandler) errorResponseWithCode(c *gin.Context, status int, errType, code, message string) {
 	errorObject := gin.H{"type": errType, "message": message}
+	addFailoverTerminalFields(c, errorObject)
 	if code != "" {
 		errorObject["code"] = code
 	}
@@ -2641,4 +2981,78 @@ func (h *GatewayHandler) getUserMsgQueueMode(account *service.Account, parsed *s
 		mode = h.cfg.Gateway.UserMessageQueue.GetEffectiveMode()
 	}
 	return mode
+}
+
+const failoverExposeDetailKey = "gateway.failover.expose_detail"
+
+func setFailoverTerminal(c *gin.Context, outcome FailoverOutcomeError) {
+	if observation := requestFailoverObservation(c); observation != nil {
+		observation.reason = outcome.Reason
+		outcome.Attempts = max(outcome.Attempts, observation.attempts)
+		if outcome.LastStatus == 0 {
+			outcome.LastStatus = observation.lastStatus
+		}
+	}
+	c.Set(failoverOutcomeContextKey, outcome)
+}
+
+func prepareFailoverTerminal(c *gin.Context, lastStatus int, reason string, cfg *config.Config) {
+	if cfg != nil {
+		c.Set(failoverExposeDetailKey, cfg.Gateway.FailoverPolicy.ExposeFailoverDetail)
+	}
+	if _, exists := c.Get(failoverOutcomeContextKey); exists {
+		return
+	}
+	setFailoverTerminal(c, FailoverOutcomeError{Reason: reason, LastStatus: lastStatus})
+}
+
+func markFailoverSuppressed(c *gin.Context, reason string, lastStatus int) {
+	if observation := requestFailoverObservation(c); observation != nil {
+		observation.suppression = reason
+	}
+	setFailoverTerminal(c, FailoverOutcomeError{Reason: "stream_started", LastStatus: lastStatus})
+}
+
+func suppressTerminalFailoverSideEffects(c *gin.Context, accountID int64) {
+	service.SuppressFailoverSideEffectsForRequest(c, accountID, service.FailoverSuppressedNextAccountStop)
+}
+
+func addFailoverTerminalFields(c *gin.Context, errorObject gin.H) {
+	value, _ := c.Get(failoverOutcomeContextKey)
+	outcome, ok := value.(FailoverOutcomeError)
+	if !ok {
+		return
+	}
+	// Budget responses keep the P3 public contract; the count remains internal.
+	if outcome.Reason != failoverReasonBudget {
+		errorObject["attempts"] = outcome.Attempts
+	}
+	errorObject["exhausted_reason"] = outcome.Reason
+	errorObject["last_status"] = outcome.LastStatus
+	if !c.GetBool(failoverExposeDetailKey) {
+		return
+	}
+	classes := make([]service.FailureClass, 0)
+	if observation := requestFailoverObservation(c); observation != nil {
+		for _, attempt := range observation.attemptsLog {
+			if attempt.class != "" {
+				classes = append(classes, attempt.class)
+			}
+		}
+	}
+	errorObject["failover"] = gin.H{"classes": classes}
+}
+
+func mixedFailoverStatus(c *gin.Context, cfg *config.Config) bool {
+	if cfg == nil || !cfg.Gateway.FailoverPolicy.Terminal.MixedStatus503 {
+		return false
+	}
+	observation := requestFailoverObservation(c)
+	if observation == nil {
+		return false
+	}
+	kinds := observation.statusKinds
+	// A pending product decision governs the reset-window aggregation. B3 only
+	// changes mixed upstream availability failures, not request errors.
+	return kinds&8 == 0 && kinds != 0 && kinds&(kinds-1) != 0
 }

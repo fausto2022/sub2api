@@ -970,7 +970,7 @@ func (s *OpenAIGatewayService) tryStickySessionHit(ctx context.Context, groupID 
 		}
 	}
 
-	if _, excluded := excludedIDs[accountID]; excluded {
+	if excludesFailoverAccount(ctx, excludedIDs, accountID) {
 		return nil
 	}
 	ctx = withOpenAIImageSizeStickyAccount(ctx, accountID)
@@ -1039,7 +1039,7 @@ func (s *OpenAIGatewayService) selectBestAccount(ctx context.Context, groupID *i
 
 		// 跳过被排除的账号
 		// Skip excluded accounts
-		if _, excluded := excludedIDs[acc.ID]; excluded {
+		if excludesFailoverAccount(ctx, excludedIDs, acc.ID) {
 			filterStats.exclude("excluded")
 			continue
 		}
@@ -1201,7 +1201,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 		if excludedIDs == nil {
 			return false
 		}
-		_, excluded := excludedIDs[accountID]
+		excluded := excludesFailoverAccount(ctx, excludedIDs, accountID)
 		return excluded
 	}
 

@@ -37,6 +37,7 @@ import (
 
 // OpenAIGatewayHandler handles OpenAI API gateway requests
 type OpenAIGatewayHandler struct {
+	upstreamCostRecorder       *service.UpstreamCostAttemptRecorder
 	compositeResolver          *service.CompositeRouteResolver
 	gatewayService             *service.OpenAIGatewayService
 	billingCacheService        *service.BillingCacheService
@@ -390,6 +391,9 @@ func NewOpenAIGatewayHandler(
 // Responses handles OpenAI Responses API endpoint
 // POST /openai/v1/responses
 func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
+	installCostAttemptAudit(c, h.upstreamCostRecorder)
+	defer finishFailoverObservation(c)
+	observedFailover := NewFailoverState(0, false)
 	// 局部兜底：确保该 handler 内部任何 panic 都不会击穿到进程级。
 	streamStarted := false
 	defer h.recoverResponsesPanic(c, &streamStarted)
@@ -659,6 +663,8 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	firstOutputTimeoutSwitchCount := 0
 	profitVetoCount := 0
 	failedAccountIDs := make(map[int64]struct{})
+	var retryAccount *service.Account
+	var retryError *service.UpstreamFailoverError
 	sameAccountRetryCount := make(map[int64]int)
 	var lastFailoverErr *service.UpstreamFailoverError
 	var oauth429FailoverState service.OpenAIOAuth429FailoverState
@@ -694,20 +700,22 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		}
 		// Select account supporting the requested model
 		reqLog.Debug("openai.account_selecting", zap.Int("excluded_account_count", len(failedAccountIDs)))
-		selection, scheduleDecision, err := h.gatewayService.SelectAccountWithSchedulerForCapability(
-			c.Request.Context(),
-			apiKey.GroupID,
-			previousResponseID,
-			sessionHash,
-			forwardModel,
-			failedAccountIDs,
-			service.OpenAIUpstreamTransportAny,
-			requiredCapability,
-			requireCompact,
-			false,
-			!imageIntent,
-			requestPlatform,
-		)
+		selectAccount := func(ctx context.Context) (*service.AccountSelectionResult, service.OpenAIAccountScheduleDecision, error) {
+			return h.gatewayService.SelectAccountWithSchedulerForCapability(ctx,
+				apiKey.GroupID,
+				previousResponseID,
+				sessionHash,
+				forwardModel,
+				failedAccountIDs,
+				service.OpenAIUpstreamTransportAny,
+				requiredCapability,
+				requireCompact,
+				false,
+				!imageIntent,
+				requestPlatform,
+			)
+		}
+		selection, scheduleDecision, err := selectOpenAIFailoverRetry(c.Request.Context(), selectAccount, h.gatewayService, &retryAccount, retryError, failedAccountIDs, &switchCount, maxAccountSwitches, &oauth429FailoverState)
 		if err != nil {
 			if failoverClientGone(c) {
 				reqLog.Info("openai.account_select_aborted_client_disconnected", zap.Error(err))
@@ -823,8 +831,13 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 					accountReleaseFunc()
 				}
 			}()
-			return h.gatewayService.Forward(c.Request.Context(), c, account, attemptBody)
+			observedFailover.observeForward(c, account, apiKey.GroupID, reqModel)
+			forwardCtx, _ := observedFailover.beginForward(openAITextFailoverContext(c, account, imageIntent), c, reqStream, 0)
+			return h.gatewayService.Forward(forwardCtx, c, account, attemptBody)
 		}()
+		if h.upstreamCostRecorder != nil {
+			recordOpenAIForwardCost(c, result, err)
+		}
 		if h.handleForwardRequestBodyMemoryOverload(c, err, streamStarted) {
 			return
 		}
@@ -949,6 +962,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 						retryLimit := effectiveSameAccountRetryLimit(failoverErr, account)
 						if sameAccountRetryAllowed(failoverErr, sameAccountRetryCount[account.ID], retryLimit) {
 							sameAccountRetryCount[account.ID]++
+							retryAccount, retryError = account, failoverErr
 							retryDelay := sameAccountRetryDelayFor(failoverErr, sameAccountRetryCount[account.ID])
 							reqLog.Warn("openai.pool_mode_same_account_retry",
 								zap.Int64("account_id", account.ID),
@@ -977,6 +991,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 						h.handleFailoverExhausted(c, failoverErr, streamStarted)
 						return
 					}
+					service.FailoverSideEffectSinkFrom(c.Request.Context()).ApproveCrossAccount(account.ID)
 					failoverSwitchFields := []zap.Field{
 						zap.Int64("account_id", account.ID),
 						zap.Int("upstream_status", failoverErr.StatusCode),
@@ -1183,6 +1198,9 @@ func (h *OpenAIGatewayHandler) logOpenAIRemoteCompactOutcome(c *gin.Context, sta
 // Messages handles Anthropic Messages API requests routed to OpenAI platform.
 // POST /v1/messages (when group platform is OpenAI)
 func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
+	installCostAttemptAudit(c, h.upstreamCostRecorder)
+	defer finishFailoverObservation(c)
+	observedFailover := NewFailoverState(0, false)
 	streamStarted := false
 	defer h.recoverAnthropicMessagesPanic(c, &streamStarted)
 
@@ -1320,6 +1338,8 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 	switchCount := 0
 	profitVetoCount := 0
 	failedAccountIDs := make(map[int64]struct{})
+	var retryAccount *service.Account
+	var retryError *service.UpstreamFailoverError
 	sameAccountRetryCount := make(map[int64]int)
 	var lastFailoverErr *service.UpstreamFailoverError
 	var oauth429FailoverState service.OpenAIOAuth429FailoverState
@@ -1338,20 +1358,22 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 			currentRoutingModel = effectiveMappedModel
 		}
 		reqLog.Debug("openai_messages.account_selecting", zap.Int("excluded_account_count", len(failedAccountIDs)))
-		selection, scheduleDecision, err := h.gatewayService.SelectAccountWithSchedulerForCapability(
-			c.Request.Context(),
-			apiKey.GroupID,
-			"", // no previous_response_id
-			sessionHash,
-			currentRoutingModel,
-			failedAccountIDs,
-			service.OpenAIUpstreamTransportAny,
-			service.OpenAIEndpointCapabilityChatCompletions,
-			false,
-			false,
-			true,
-			requestPlatform,
-		)
+		selectAccount := func(ctx context.Context) (*service.AccountSelectionResult, service.OpenAIAccountScheduleDecision, error) {
+			return h.gatewayService.SelectAccountWithSchedulerForCapability(ctx,
+				apiKey.GroupID,
+				"", // no previous_response_id
+				sessionHash,
+				currentRoutingModel,
+				failedAccountIDs,
+				service.OpenAIUpstreamTransportAny,
+				service.OpenAIEndpointCapabilityChatCompletions,
+				false,
+				false,
+				true,
+				requestPlatform,
+			)
+		}
+		selection, scheduleDecision, err := selectOpenAIFailoverRetry(c.Request.Context(), selectAccount, h.gatewayService, &retryAccount, retryError, failedAccountIDs, &switchCount, maxAccountSwitches, &oauth429FailoverState)
 		if err != nil {
 			if failoverClientGone(c) {
 				reqLog.Info("openai_messages.account_select_aborted_client_disconnected", zap.Error(err))
@@ -1420,8 +1442,13 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 					accountReleaseFunc()
 				}
 			}()
-			return h.gatewayService.ForwardAsAnthropic(c.Request.Context(), c, account, forwardBody, promptCacheKey, defaultMappedModel)
+			observedFailover.observeForward(c, account, apiKey.GroupID, reqModel)
+			forwardCtx, _ := observedFailover.beginForward(openAITextFailoverContext(c, account, false), c, reqStream, 0)
+			return h.gatewayService.ForwardAsAnthropic(forwardCtx, c, account, forwardBody, promptCacheKey, defaultMappedModel)
 		}()
+		if h.upstreamCostRecorder != nil {
+			recordOpenAIForwardCost(c, result, err)
+		}
 		var cyberBlockBodyMsg []byte
 		if service.GetOpsCyberPolicy(c) != nil {
 			cyberBlockBodyMsg = body
@@ -1518,6 +1545,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 						retryLimit := effectiveSameAccountRetryLimit(failoverErr, account)
 						if sameAccountRetryAllowed(failoverErr, sameAccountRetryCount[account.ID], retryLimit) {
 							sameAccountRetryCount[account.ID]++
+							retryAccount, retryError = account, failoverErr
 							retryDelay := sameAccountRetryDelayFor(failoverErr, sameAccountRetryCount[account.ID])
 							reqLog.Warn("openai_messages.pool_mode_same_account_retry",
 								zap.Int64("account_id", account.ID),
@@ -1546,6 +1574,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 						h.handleAnthropicFailoverExhausted(c, failoverErr, streamStarted)
 						return
 					}
+					service.FailoverSideEffectSinkFrom(c.Request.Context()).ApproveCrossAccount(account.ID)
 					reqLog.Warn("openai_messages.upstream_failover_switching",
 						zap.Int64("account_id", account.ID),
 						zap.Int("upstream_status", failoverErr.StatusCode),
@@ -1615,19 +1644,19 @@ func resolveOpenAIMessagesMetadataSession(c *gin.Context, sessionHash, promptCac
 
 // anthropicErrorResponse writes an error in Anthropic Messages API format.
 func (h *OpenAIGatewayHandler) anthropicErrorResponse(c *gin.Context, status int, errType, message string) {
-	c.JSON(status, gin.H{
-		"type": "error",
-		"error": gin.H{
-			"type":    errType,
-			"message": message,
-		},
-	})
+	object := gin.H{"type": errType, "message": message}
+	addFailoverTerminalFields(c, object)
+	c.JSON(status, gin.H{"type": "error", "error": object})
 }
 
 // anthropicStreamingAwareError handles errors that may occur during streaming,
 // using Anthropic SSE error format.
 func (h *OpenAIGatewayHandler) anthropicStreamingAwareError(c *gin.Context, status int, errType, message string, streamStarted bool) {
 	if streamStarted {
+		if _, terminal := c.Get(failoverOutcomeContextKey); terminal {
+			(&GatewayHandler{}).handleStreamingAwareError(c, status, errType, message, true)
+			return
+		}
 		flusher, ok := c.Writer.(http.Flusher)
 		if ok {
 			errPayload, _ := json.Marshal(gin.H{
@@ -1647,6 +1676,11 @@ func (h *OpenAIGatewayHandler) anthropicStreamingAwareError(c *gin.Context, stat
 
 // handleAnthropicFailoverExhausted maps upstream failover errors to Anthropic format.
 func (h *OpenAIGatewayHandler) handleAnthropicFailoverExhausted(c *gin.Context, failoverErr *service.UpstreamFailoverError, streamStarted bool) {
+	lastStatus := 0
+	if failoverErr != nil {
+		lastStatus = failoverErr.StatusCode
+	}
+	prepareFailoverTerminal(c, lastStatus, "accounts", h.cfg)
 	if failoverErr != nil {
 		copyFailoverRetryAfter(c, failoverErr.ResponseHeaders)
 	}
@@ -1663,7 +1697,10 @@ func (h *OpenAIGatewayHandler) handleAnthropicFailoverExhausted(c *gin.Context, 
 		h.anthropicStreamingAwareError(c, status, "api_error", failoverErr.ClientMessage, streamStarted)
 		return
 	}
-	status, errType, errMsg := h.mapUpstreamError(failoverErr.StatusCode)
+	status, errType, errMsg := h.mapUpstreamError(lastStatus)
+	if mixedFailoverStatus(c, h.cfg) {
+		status = http.StatusServiceUnavailable
+	}
 	h.anthropicStreamingAwareError(c, status, errType, errMsg, streamStarted)
 }
 
@@ -3590,6 +3627,11 @@ func (h *OpenAIGatewayHandler) handleConcurrencyError(c *gin.Context, err error,
 }
 
 func (h *OpenAIGatewayHandler) handleFailoverExhausted(c *gin.Context, failoverErr *service.UpstreamFailoverError, streamStarted bool) {
+	lastStatus := 0
+	if failoverErr != nil {
+		lastStatus = failoverErr.StatusCode
+	}
+	prepareFailoverTerminal(c, lastStatus, "accounts", h.cfg)
 	if failoverErr == nil {
 		h.handleFailoverExhaustedSimple(c, http.StatusBadGateway, streamStarted)
 		return
@@ -3676,6 +3718,9 @@ func (h *OpenAIGatewayHandler) handleFailoverExhausted(c *gin.Context, failoverE
 
 	// 使用默认的错误映射
 	status, errType, errMsg := h.mapUpstreamError(statusCode)
+	if mixedFailoverStatus(c, h.cfg) {
+		status = http.StatusServiceUnavailable
+	}
 	h.handleStreamingAwareError(c, status, errType, errMsg, streamStarted)
 }
 
@@ -3826,6 +3871,12 @@ func (h *OpenAIGatewayHandler) handleStreamingAwareErrorWithCode(
 		streamStarted = true
 	}
 	if streamStarted {
+		if _, terminal := c.Get(failoverOutcomeContextKey); terminal {
+			if service.IsResponseCommitted(c) {
+				return
+			}
+			service.MarkResponseCommitted(c)
+		}
 		if countTowardsSLA {
 			service.MarkOpsStreamFailure(c, errType, code, message, status)
 		} else {
@@ -3844,6 +3895,7 @@ func (h *OpenAIGatewayHandler) handleStreamingAwareErrorWithCode(
 		flusher, ok := c.Writer.(http.Flusher)
 		if ok {
 			errorObject := gin.H{"type": errType, "message": message}
+			addFailoverTerminalFields(c, errorObject)
 			if code != "" {
 				errorObject["code"] = code
 			}
@@ -4011,12 +4063,9 @@ func (h *OpenAIGatewayHandler) errorResponse(c *gin.Context, status int, errType
 			return
 		}
 	}
-	c.JSON(status, gin.H{
-		"error": gin.H{
-			"type":    errType,
-			"message": message,
-		},
-	})
+	errorObject := gin.H{"type": errType, "message": message}
+	addFailoverTerminalFields(c, errorObject)
+	c.JSON(status, gin.H{"error": errorObject})
 }
 
 // openAICompactKeepaliveInterval 复用流式 keepalive 配置作为 compact 下游

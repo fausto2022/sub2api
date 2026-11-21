@@ -23,7 +23,7 @@ export function formatScaled(value: number | null, scale: number, minFractionDig
   return `$${s}`
 }
 
-import type { UserPricingInterval } from '@/api/channels'
+import type { UserPricingInterval, UserSupportedModelPricing } from '@/api/channels'
 
 type TokenPrices = Pick<UserPricingInterval, 'input_price' | 'output_price' | 'cache_write_price' | 'cache_write_1h_price' | 'cache_write_12h_price' | 'cache_read_price'>
 
@@ -39,5 +39,43 @@ export function resolveIntervalPrices(iv: UserPricingInterval, base: TokenPrices
     cache_write_1h_price: iv.cache_write_1h_price ?? iv.cache_write_price ?? price(null, iv.cache_write_multiplier, base.cache_write_1h_price),
     cache_write_12h_price: iv.cache_write_12h_price ?? (base.cache_write_12h_price == null ? null : iv.cache_write_price ?? price(null, iv.cache_write_multiplier, base.cache_write_12h_price)),
     cache_read_price: price(iv.cache_read_price, iv.cache_read_multiplier, base.cache_read_price)
+  }
+}
+
+/** 按倍率缩放单价；null 透传（未配置保持未配置，不变成 0）。 */
+function scalePrice(value: number | null | undefined, rate: number): number | null {
+  if (value == null) return null
+  return value * rate
+}
+
+/**
+ * 按倍率缩放整份展示定价，含基础单价、按次/图片价与全部阶梯档位。
+ *
+ * 仅用于**后端未下发 `discounted_pricing`** 的兜底路径（旧响应）。后端已按生效倍率
+ * （含登录态专属倍率与图片/视频独立倍率）预计算折后价时，必须直接使用后端值，
+ * 不可再调本函数，否则专属倍率用户会看到与实付不一致的价格。
+ */
+export function scalePricing(pricing: UserSupportedModelPricing, rate: number): UserSupportedModelPricing {
+  return {
+    ...pricing,
+    input_price: scalePrice(pricing.input_price, rate),
+    output_price: scalePrice(pricing.output_price, rate),
+    cache_write_price: scalePrice(pricing.cache_write_price, rate),
+    cache_write_1h_price: scalePrice(pricing.cache_write_1h_price, rate),
+    cache_write_12h_price: scalePrice(pricing.cache_write_12h_price, rate),
+    cache_read_price: scalePrice(pricing.cache_read_price, rate),
+    image_input_price: scalePrice(pricing.image_input_price, rate),
+    image_output_price: scalePrice(pricing.image_output_price, rate),
+    per_request_price: scalePrice(pricing.per_request_price, rate),
+    intervals: (pricing.intervals ?? []).map((iv) => ({
+      ...iv,
+      input_price: scalePrice(iv.input_price, rate),
+      output_price: scalePrice(iv.output_price, rate),
+      cache_write_price: scalePrice(iv.cache_write_price, rate),
+      cache_write_1h_price: scalePrice(iv.cache_write_1h_price, rate),
+      cache_write_12h_price: scalePrice(iv.cache_write_12h_price, rate),
+      cache_read_price: scalePrice(iv.cache_read_price, rate),
+      per_request_price: scalePrice(iv.per_request_price, rate)
+    }))
   }
 }

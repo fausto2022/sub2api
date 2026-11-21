@@ -305,9 +305,21 @@ type PricingService struct {
 	pricingData  map[string]*LiteLLMModelPricing
 	lastUpdated  time.Time
 	localHash    string
-	// fallback/override 文件在最近一次成功重建时的内容指纹，定时器据此判断是否
-	// 需要从本地目录缓存重建叠加层。
+	// fallback/override/人民币层文件在最近一次成功重建时的内容指纹，定时器据此判断
+	// 是否从本地目录缓存重建叠加层。
 	customFilesHash string
+	// pricingDataSources 记录每个模型的价格来源（litellm/fallback/override/cny），
+	// 供管理端展示；在每次重建提交时随 pricingData 一起更新。
+	pricingDataSources map[string]string
+	// overrideModels / cnyModels 是 override 文件与人民币层命中的模型集合（小写）。
+	// 计费侧据此判断管理员是否接管了该模型（DeepSeek 官方价让位规则）。
+	overrideModels map[string]struct{}
+	cnyModels      map[string]struct{}
+	// peakConfigs 是 override 文件中 `_catalog` 元数据声明的模型级峰谷双价配置。
+	// 与 cnyModels/overrideModels 同一把锁保护，随重建一起刷新。
+	peakConfigs map[string]PeakAwarePricing
+	// peakSettings 是全局峰谷时段设置；为空时按官方口径判定。
+	peakSettings PeakPricingSettings
 
 	// 停止信号
 	stopCh chan struct{}
@@ -498,22 +510,42 @@ func (s *PricingService) syncWithRemote() error {
 	return nil
 }
 
-// hasCustomPricingFiles 报告是否配置了 fallback/override 任一文件路径（不要求文件存在）。
+// hasCustomPricingFiles 报告是否配置了 fallback/override/人民币层任一文件路径
+// （不要求文件存在）。
 func (s *PricingService) hasCustomPricingFiles() bool {
 	if s == nil || s.cfg == nil {
 		return false
 	}
-	return strings.TrimSpace(s.cfg.Pricing.FallbackFile) != "" || strings.TrimSpace(s.cfg.Pricing.OverrideFile) != ""
+	for _, path := range s.customPricingFilePaths() {
+		if strings.TrimSpace(path) != "" {
+			return true
+		}
+	}
+	return false
 }
 
-// customPricingFilesFingerprint 返回 fallback、override 两个文件当前内容的联合 sha256。
-// 每个文件以"长度前缀 + 正文"参与计算，不可读的文件按空正文处理；未配置任何文件返回空串。
+// customPricingFilePaths 返回参与热重载比对的本地叠加层文件路径。
+// 人民币层路径按 EffectiveCNYOverrideFile 推导；三项都可能为空。
+func (s *PricingService) customPricingFilePaths() []string {
+	if s == nil || s.cfg == nil {
+		return nil
+	}
+	return []string{
+		s.cfg.Pricing.FallbackFile,
+		s.cfg.Pricing.OverrideFile,
+		s.EffectiveCNYOverrideFile(),
+	}
+}
+
+// customPricingFilesFingerprint 返回 fallback、override、人民币层三个文件当前内容的
+// 联合 sha256。每个文件以"长度前缀 + 正文"参与计算，不可读的文件按空正文处理；
+// 未配置任何文件返回空串。
 func (s *PricingService) customPricingFilesFingerprint() string {
 	if !s.hasCustomPricingFiles() {
 		return ""
 	}
 	h := sha256.New()
-	for _, path := range []string{s.cfg.Pricing.FallbackFile, s.cfg.Pricing.OverrideFile} {
+	for _, path := range s.customPricingFilePaths() {
 		var body []byte
 		if p := strings.TrimSpace(path); p != "" {
 			body, _ = os.ReadFile(p)
@@ -566,14 +598,13 @@ func (s *PricingService) reloadIfCustomFilesChanged() {
 	}
 }
 
-// reloadCustomPricingLayers 读取本地目录缓存并重新叠加 fallback/override，只替换内存数据
-// 与叠加层指纹。
+// reloadCustomPricingLayers 读取本地目录缓存并重新叠加 fallback/override/人民币层，
+// 只替换内存数据与叠加层指纹。
 func (s *PricingService) reloadCustomPricingLayers() error {
 	pricingFile := s.getPricingFilePath()
 	// 定价层文件可能在读取期间被替换。只有构建前后指纹一致时才提交，
 	// 否则丢弃这次混合快照并重试，避免短暂应用不匹配的 fallback/override。
-	var data map[string]*LiteLLMModelPricing
-	var fingerprint string
+	var built *pricingBuild
 	var err error
 	for attempt := 0; attempt < 3; attempt++ {
 		if validateErr := s.validateCustomPricingFiles(); validateErr != nil {
@@ -584,7 +615,7 @@ func (s *PricingService) reloadCustomPricingLayers() error {
 		if readErr != nil {
 			return fmt.Errorf("read file failed: %w", readErr)
 		}
-		data, fingerprint, err = s.buildPricingData(body)
+		built, err = s.buildPricingData(body)
 		if err != nil {
 			return fmt.Errorf("parse pricing data: %w", err)
 		}
@@ -592,7 +623,7 @@ func (s *PricingService) reloadCustomPricingLayers() error {
 		if validateErr := s.validateCustomPricingFiles(); validateErr != nil {
 			return fmt.Errorf("validate custom pricing files: %w", validateErr)
 		}
-		if before == after && after == fingerprint {
+		if before == after && after == built.fingerprint {
 			break
 		}
 		if attempt == 2 {
@@ -600,14 +631,19 @@ func (s *PricingService) reloadCustomPricingLayers() error {
 		}
 	}
 
-	s.mu.Lock()
-	warnDroppedLongContextLadders(s.pricingData, data)
-	s.pricingData = data
-	s.customFilesHash = fingerprint
-	s.mu.Unlock()
+	s.commitPricingBuild(built)
 
-	logger.LegacyPrintf("service.pricing", "[Pricing] Custom pricing files changed, reloaded %d models from %s", len(data), pricingFile)
+	logger.LegacyPrintf("service.pricing", "[Pricing] Custom pricing files changed, reloaded %d models from %s", len(built.data), pricingFile)
 	return nil
+}
+
+// ReloadCustomPricingLayers 立即从本地目录缓存重建全部叠加层并热替换内存价格，
+// 供管理端写入 override/人民币层文件后生效，无需重启。
+func (s *PricingService) ReloadCustomPricingLayers() error {
+	if s == nil || s.cfg == nil {
+		return fmt.Errorf("pricing service is not configured")
+	}
+	return s.reloadCustomPricingLayers()
 }
 
 // downloadPricingData 从远程下载价格数据
@@ -644,7 +680,7 @@ func (s *PricingService) downloadPricingData() error {
 			remoteHash[:min(8, len(remoteHash))], dataHashStr[:8])
 	}
 
-	data, customFilesHash, err := s.buildPricingData(body)
+	built, err := s.buildPricingData(body)
 	if err != nil {
 		return fmt.Errorf("parse pricing data: %w", err)
 	}
@@ -668,14 +704,18 @@ func (s *PricingService) downloadPricingData() error {
 
 	// 更新内存数据
 	s.mu.Lock()
-	warnDroppedLongContextLadders(s.pricingData, data)
-	s.pricingData = data
+	warnDroppedLongContextLadders(s.pricingData, built.data)
+	s.pricingData = built.data
+	s.pricingDataSources = built.sources
+	s.overrideModels = built.overrideModels
+	s.cnyModels = built.cnyModels
+	s.peakConfigs = built.peakConfigs
 	s.lastUpdated = time.Now()
 	s.localHash = syncHash
-	s.customFilesHash = customFilesHash
+	s.customFilesHash = built.fingerprint
 	s.mu.Unlock()
 
-	logger.LegacyPrintf("service.pricing", "[Pricing] Downloaded %d models successfully", len(data))
+	logger.LegacyPrintf("service.pricing", "[Pricing] Downloaded %d models successfully", len(built.data))
 	return nil
 }
 
@@ -947,15 +987,261 @@ func warnOrphanCacheTierFields(entries []string) {
 	logger.LegacyPrintf("service.pricing", "[Pricing] Warning: %d model(s) carry cache above-tier prices without a base cache price; that cache item bills at $0 until the catalog/override supplies the base: %s", total, strings.Join(entries, ", "))
 }
 
-// applyPricingOverrides 把 override 文件的条目逐字段修补进原始目录数据。目录与回退
-// 文件的解析都经过 parsePricingData，因此 override 是最高优先级的数据源。这里只修补
-// 已存在的条目：目录/回退里都没有的模型由 mergeOverrideOnlyModels 在两层数据合并后
-// 统一并入——若在此处抢先建条目，纯 override 条目会挡住回退文件中同名完整条目的合并。
+// ============================================================
+// 人民币计费口径（cny-overrides.json）
+// ============================================================
+
+const (
+	// CNYModeConvert 按汇率折算：USD = CNY / cny_per_usd。
+	CNYModeConvert = "convert"
+	// CNYModeDirect 直接使用人民币原生价：USD = CNY（¥1 = $1，对应"充值为 1 元人民币兑 1 美元"）。
+	CNYModeDirect = "direct"
+	// defaultCNYPerUSD 内置人民币登记价使用的默认汇率口径（与 billing_service.go 注释一致）。
+	defaultCNYPerUSD = 7.14
+	// cnyOverrideFileName 人民币层文件名：未显式配置 cny_override_file 时按目录推导。
+	cnyOverrideFileName = "cny-overrides.json"
+	// cnyOnlyProvider 是仅有人民币登记、目录中不存在的模型使用的 provider 标识。
+	cnyOnlyProvider = "cny"
+)
+
+// LiteLLMCNYModelPricing 是人民币层中单个模型的人民币原生登记价（CNY / 1M tokens）。
+// 字段缺失或 0 表示该字段未登记（不覆盖下层数据）。
+type LiteLLMCNYModelPricing struct {
+	InputCNYPerMTok      *float64 `json:"input_cny_per_mtok,omitempty"`
+	OutputCNYPerMTok     *float64 `json:"output_cny_per_mtok,omitempty"`
+	CacheReadCNYPerMTok  *float64 `json:"cache_read_cny_per_mtok,omitempty"`
+	CacheWriteCNYPerMTok *float64 `json:"cache_write_cny_per_mtok,omitempty"`
+	ImageInputCNYPerMTok *float64 `json:"image_input_cny_per_mtok,omitempty"`
+}
+
+// LiteLLMCNYOverrideFile 是 cny-overrides.json 的完整结构。
+type LiteLLMCNYOverrideFile struct {
+	Version   int                               `json:"version,omitempty"`
+	Mode      string                            `json:"mode,omitempty"`
+	CNYPerUSD *float64                          `json:"cny_per_usd,omitempty"`
+	Models    map[string]LiteLLMCNYModelPricing `json:"models,omitempty"`
+}
+
+// CNYSettings 是人民币层的生效口径：模式、汇率与文件路径。
+type CNYSettings struct {
+	Mode      string
+	CNYPerUSD float64
+	File      string
+}
+
+// ConversionRate 返回到 USD 的换算系数：direct 固定 1（¥1 = $1），
+// convert 使用 cny_per_usd（缺失或非法时回落默认 7.14）。
+func (c CNYSettings) ConversionRate() float64 {
+	if c.Mode == CNYModeDirect {
+		return 1
+	}
+	if c.CNYPerUSD > 0 {
+		return c.CNYPerUSD
+	}
+	return defaultCNYPerUSD
+}
+
+// NormalizedMode 返回规范化后的模式，非法值按 convert 处理。
+func (c CNYSettings) NormalizedMode() string {
+	if c.Mode == CNYModeDirect {
+		return CNYModeDirect
+	}
+	return CNYModeConvert
+}
+
+// EffectiveCNYOverrideFile 返回人民币层文件的有效路径。推导顺序：
+//  1. 显式配置的 pricing.cny_override_file；
+//  2. 配置了 pricing.override_file 时取同目录下的 cny-overrides.json；
+//  3. pricing.data_dir 下的 cny-overrides.json。
+//
+// 三者都为空时返回空串（人民币层禁用）。
+func (s *PricingService) EffectiveCNYOverrideFile() string {
+	if s == nil || s.cfg == nil {
+		return ""
+	}
+	if path := strings.TrimSpace(s.cfg.Pricing.CNYOverrideFile); path != "" {
+		return path
+	}
+	if override := strings.TrimSpace(s.cfg.Pricing.OverrideFile); override != "" {
+		return filepath.Join(filepath.Dir(override), cnyOverrideFileName)
+	}
+	if dir := strings.TrimSpace(s.cfg.Pricing.DataDir); dir != "" {
+		return filepath.Join(dir, cnyOverrideFileName)
+	}
+	return ""
+}
+
+// loadCNYOverrideFile 读取并校验人民币层文件。文件缺失、不可读或 JSON 非法时返回
+// 空配置（只告警，不影响启动与其它层，与 override 文件的降级行为一致）。
+func (s *PricingService) loadCNYOverrideFile() *LiteLLMCNYOverrideFile {
+	empty := &LiteLLMCNYOverrideFile{Mode: CNYModeConvert}
+	path := s.EffectiveCNYOverrideFile()
+	if path == "" {
+		return empty
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			logger.LegacyPrintf("service.pricing", "[Pricing] Warning: CNY pricing layer skipped: %v", err)
+		}
+		return empty
+	}
+	var file LiteLLMCNYOverrideFile
+	if err := json.Unmarshal(body, &file); err != nil {
+		logger.LegacyPrintf("service.pricing", "[Pricing] Warning: CNY pricing layer skipped: invalid JSON in %s: %v", path, err)
+		return empty
+	}
+	return &file
+}
+
+// normalizeCNYSettings 把文件中的模式/汇率校正为生效值，非法值回落到默认口径并告警。
+func (s *PricingService) normalizeCNYSettings(file *LiteLLMCNYOverrideFile, path string) CNYSettings {
+	settings := CNYSettings{Mode: CNYModeConvert, CNYPerUSD: defaultCNYPerUSD, File: path}
+	if file == nil {
+		return settings
+	}
+	switch mode := strings.ToLower(strings.TrimSpace(file.Mode)); mode {
+	case "":
+	case CNYModeConvert, CNYModeDirect:
+		settings.Mode = mode
+	default:
+		logger.LegacyPrintf("service.pricing", "[Pricing] Warning: CNY pricing layer mode %q is invalid, falling back to %s", file.Mode, CNYModeConvert)
+	}
+	if file.CNYPerUSD != nil {
+		if *file.CNYPerUSD > 0 {
+			settings.CNYPerUSD = *file.CNYPerUSD
+		} else if settings.Mode == CNYModeConvert {
+			logger.LegacyPrintf("service.pricing", "[Pricing] Warning: CNY per USD rate %v is invalid, falling back to %v", *file.CNYPerUSD, defaultCNYPerUSD)
+		}
+	}
+	return settings
+}
+
+// CurrentCNYSettings 返回当前生效的人民币口径设置（模式、汇率与文件路径）。
+func (s *PricingService) CurrentCNYSettings() CNYSettings {
+	if s == nil {
+		return CNYSettings{Mode: CNYModeConvert, CNYPerUSD: defaultCNYPerUSD}
+	}
+	path := s.EffectiveCNYOverrideFile()
+	return s.normalizeCNYSettings(s.loadCNYOverrideFile(), path)
+}
+
+// CurrentCNYModelPrices 返回当前人民币层登记的逐模型原生价（深拷贝）。
+func (s *PricingService) CurrentCNYModelPrices() map[string]LiteLLMCNYModelPricing {
+	file := s.loadCNYOverrideFile()
+	out := make(map[string]LiteLLMCNYModelPricing, len(file.Models))
+	for name, price := range file.Models {
+		out[name] = cloneCNYModelPricing(price)
+	}
+	return out
+}
+
+// cloneCNYModelPricing 深拷贝单模型人民币登记价（字段均为指针）。
+func cloneCNYModelPricing(price LiteLLMCNYModelPricing) LiteLLMCNYModelPricing {
+	clone := LiteLLMCNYModelPricing{}
+	for _, pair := range []struct {
+		dst **float64
+		src *float64
+	}{
+		{&clone.InputCNYPerMTok, price.InputCNYPerMTok},
+		{&clone.OutputCNYPerMTok, price.OutputCNYPerMTok},
+		{&clone.CacheReadCNYPerMTok, price.CacheReadCNYPerMTok},
+		{&clone.CacheWriteCNYPerMTok, price.CacheWriteCNYPerMTok},
+		{&clone.ImageInputCNYPerMTok, price.ImageInputCNYPerMTok},
+	} {
+		if pair.src == nil {
+			continue
+		}
+		value := *pair.src
+		*pair.dst = &value
+	}
+	return clone
+}
+
+// cnyPricingFields 把人民币登记价换算成 LiteLLM 原始字段补丁（USD / token）。
+// 字段级 0 或缺失表示未登记；负值视为非法并跳过（写入口已校验，此处兜底）。
+func (s *PricingService) cnyPricingFields() (map[string]map[string]float64, CNYSettings) {
+	path := s.EffectiveCNYOverrideFile()
+	file := s.loadCNYOverrideFile()
+	settings := s.normalizeCNYSettings(file, path)
+	rate := settings.ConversionRate()
+	out := make(map[string]map[string]float64, len(file.Models))
+	for name, price := range file.Models {
+		fields := make(map[string]float64, 5)
+		put := func(field string, value *float64) {
+			if value == nil || *value <= 0 {
+				return
+			}
+			fields[field] = *value / 1e6 / rate
+		}
+		put("input_cost_per_token", price.InputCNYPerMTok)
+		put("output_cost_per_token", price.OutputCNYPerMTok)
+		put("cache_read_input_token_cost", price.CacheReadCNYPerMTok)
+		put("cache_creation_input_token_cost", price.CacheWriteCNYPerMTok)
+		put("input_cost_per_image_token", price.ImageInputCNYPerMTok)
+		if len(fields) == 0 {
+			continue
+		}
+		out[strings.ToLower(strings.TrimSpace(name))] = fields
+	}
+	return out, settings
+}
+
+// nonNullUSDFields 返回 USD override 补丁里显式给出的字段名。字段值为 null 表示
+// 删除该字段（回退到下一层），不算显式设置。
+func nonNullUSDFields(patch json.RawMessage) map[string]bool {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(patch, &fields); err != nil {
+		return nil
+	}
+	out := make(map[string]bool, len(fields))
+	for key, raw := range fields {
+		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			continue
+		}
+		out[key] = true
+	}
+	return out
+}
+
+// mergeCNYPricingFields 把人民币层换算后的字段并入 base，skip 中的字段（USD 显式覆盖）
+// 保持不动。base 不是 JSON 对象时返回原 base。
+func mergeCNYPricingFields(base json.RawMessage, fields map[string]float64, skip map[string]bool) json.RawMessage {
+	if len(fields) == 0 {
+		return base
+	}
+	merged := make(map[string]any)
+	if len(base) > 0 {
+		if err := json.Unmarshal(base, &merged); err != nil {
+			merged = make(map[string]any)
+		}
+	}
+	for key, value := range fields {
+		if skip[key] {
+			continue
+		}
+		merged[key] = value
+	}
+	out, err := json.Marshal(merged)
+	if err != nil {
+		return base
+	}
+	return out
+}
+
+// applyPricingOverrides 把人民币层与 override 文件的条目逐字段修补进原始目录数据。
+// 目录与回退文件的解析都经过 parsePricingData，因此这些层是最高优先级的数据源。
+//
+// 叠加顺序（字段级）：目录 → 人民币层（换算后）→ USD override。
+//   - USD override 显式给出的字段最优先，人民币层不覆盖；
+//   - USD override 中值为 null 的字段被删除，此时人民币层重新填补（回退人民币层），
+//     人民币层也没有则回退目录值；
+//   - 目录/回退里都没有的模型分别由 mergeOverrideOnlyModels / mergeCNYOnlyModels
+//     在两层数据合并后统一并入。
 func (s *PricingService) applyPricingOverrides(rawData map[string]json.RawMessage) map[string]json.RawMessage {
 	overrides := s.loadPricingOverrideEntries()
-	if len(overrides) == 0 {
-		return rawData
-	}
+	cnyFields, _ := s.cnyPricingFields()
+
 	for name, patch := range overrides {
 		base, ok := rawData[name]
 		if !ok {
@@ -966,7 +1252,20 @@ func (s *PricingService) applyPricingOverrides(rawData map[string]json.RawMessag
 			logger.LegacyPrintf("service.pricing", "[Pricing] Warning: override entry %q skipped: not a JSON object", name)
 			continue
 		}
+		if fields, ok := cnyFields[strings.ToLower(name)]; ok {
+			merged = mergeCNYPricingFields(merged, fields, nonNullUSDFields(patch))
+		}
 		rawData[name] = merged
+	}
+
+	for name, fields := range cnyFields {
+		if _, ok := rawData[name]; !ok {
+			continue
+		}
+		if _, ok := overrides[name]; ok {
+			continue // 该模型已在上面的 USD 合并路径处理
+		}
+		rawData[name] = mergeCNYPricingFields(rawData[name], fields, nil)
 	}
 	return rawData
 }
@@ -1065,18 +1364,300 @@ func (s *PricingService) mergeOverrideOnlyModels(data map[string]*LiteLLMModelPr
 	return data
 }
 
-// buildPricingData 解析目录正文并依次叠加 fallback、override 两层，返回合并结果与
-// 叠加层文件指纹。指纹在合并读取之前采样：并发改文件只会让存下的指纹落后于实际
-// 合并的数据、不会领先，下一轮定时比对因此会再次重建。
-func (s *PricingService) buildPricingData(body []byte) (map[string]*LiteLLMModelPricing, string, error) {
-	fingerprint := s.customPricingFilesFingerprint()
-	data, err := s.parsePricingData(body)
-	if err != nil {
-		return nil, "", err
+// mergeCNYOnlyModels 把只有人民币登记、目录/回退两层都不存在的模型作为独立条目并入
+// （复用主解析路径做有效性过滤与 above 折算）。USD override 仍最优先：同名字段以
+// USD 显式值为准，null 删除后由人民币层回填。
+func (s *PricingService) mergeCNYOnlyModels(data map[string]*LiteLLMModelPricing) map[string]*LiteLLMModelPricing {
+	cnyFields, _ := s.cnyPricingFields()
+	if len(cnyFields) == 0 {
+		return data
 	}
-	data = s.mergeFallbackPricingData(data)
+	if data == nil {
+		data = make(map[string]*LiteLLMModelPricing)
+	}
+	overrides := s.loadPricingOverrideEntries()
+	leftover := make(map[string]json.RawMessage)
+	for name, fields := range cnyFields {
+		if _, ok := data[name]; ok {
+			continue
+		}
+		entry := map[string]any{"litellm_provider": cnyOnlyProvider, "mode": "chat"}
+		for key, value := range fields {
+			entry[key] = value
+		}
+		body, err := json.Marshal(entry)
+		if err != nil {
+			continue
+		}
+		if patch, ok := overrides[name]; ok {
+			merged, valid := mergePricingOverrideEntry(body, patch)
+			if !valid {
+				logger.LegacyPrintf("service.pricing", "[Pricing] Warning: override entry %q skipped: not a JSON object", name)
+				continue
+			}
+			leftover[name] = mergeCNYPricingFields(merged, fields, nonNullUSDFields(patch))
+			continue
+		}
+		leftover[name] = body
+	}
+	if len(leftover) == 0 {
+		return data
+	}
+	if body, err := json.Marshal(leftover); err == nil {
+		if parsed, err := s.parsePricingData(body); err == nil {
+			maps.Copy(data, parsed)
+		}
+	}
+	return data
+}
+
+// pricingBuild 是一次目录重建的结果：合并后的价格表、叠加层指纹、逐模型来源，
+// 以及 override / 人民币层命中的模型集合。
+type pricingBuild struct {
+	data           map[string]*LiteLLMModelPricing
+	fingerprint    string
+	sources        map[string]string
+	overrideModels map[string]struct{}
+	cnyModels      map[string]struct{}
+	// peakConfigs 是 override 文件 `_catalog` 声明的模型级峰谷双价（小写模型名）。
+	peakConfigs map[string]PeakAwarePricing
+}
+
+// buildPricingData 解析目录正文并依次叠加 fallback、override、人民币层，返回合并结果、
+// 叠加层文件指纹、逐模型来源与被管理员接管的模型集合。指纹在合并读取之前采样：并发改
+// 文件只会让存下的指纹落后于实际合并的数据、不会领先，下一轮定时比对因此会再次重建。
+func (s *PricingService) buildPricingData(body []byte) (*pricingBuild, error) {
+	fingerprint := s.customPricingFilesFingerprint()
+	catalog, err := s.parsePricingData(body)
+	if err != nil {
+		return nil, err
+	}
+	catalogKeys := make(map[string]struct{}, len(catalog))
+	for name := range catalog {
+		catalogKeys[name] = struct{}{}
+	}
+
+	data := s.mergeFallbackPricingData(catalog)
 	data = s.mergeOverrideOnlyModels(data)
-	return data, fingerprint, nil
+	data = s.mergeCNYOnlyModels(data)
+
+	overrides := s.loadPricingOverrideEntries()
+	cnyFields, _ := s.cnyPricingFields()
+	overrideModels := make(map[string]struct{}, len(overrides))
+	for name := range overrides {
+		overrideModels[strings.ToLower(strings.TrimSpace(name))] = struct{}{}
+	}
+	cnyModels := make(map[string]struct{}, len(cnyFields))
+	for name := range cnyFields {
+		cnyModels[name] = struct{}{}
+	}
+	// `_catalog` 元数据里的峰谷双价：与 override 同源，仅启用时才进表。
+	peakConfigs := make(map[string]PeakAwarePricing)
+	for name, raw := range overrides {
+		meta, ok := parseCatalogMeta(raw)
+		if !ok || !meta.PeakEnabled {
+			continue
+		}
+		peakConfigs[normalizeCatalogModel(name)] = peakAwareFromMeta(meta)
+	}
+	fallbackKeys := s.loadPricingFileKeys(s.cfg.Pricing.FallbackFile)
+
+	sources := make(map[string]string, len(data))
+	for name := range data {
+		lower := strings.ToLower(strings.TrimSpace(name))
+		switch {
+		case hasKey(catalogKeys, lower):
+			sources[name] = "litellm"
+		case hasKey(fallbackKeys, lower):
+			sources[name] = "fallback"
+		case hasKey(overrideModels, lower):
+			sources[name] = "override"
+		case hasKey(cnyModels, lower):
+			sources[name] = "cny"
+		default:
+			sources[name] = "litellm"
+		}
+	}
+
+	return &pricingBuild{
+		data:           data,
+		fingerprint:    fingerprint,
+		sources:        sources,
+		overrideModels: overrideModels,
+		cnyModels:      cnyModels,
+		peakConfigs:    peakConfigs,
+	}, nil
+}
+
+// loadPricingFileKeys 读取 JSON 对象文件的模型名集合（原样大小写）。文件缺失或非法
+// 返回空集合，仅用于来源标注。
+func (s *PricingService) loadPricingFileKeys(path string) map[string]struct{} {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var entries map[string]json.RawMessage
+	if err := json.Unmarshal(body, &entries); err != nil {
+		return nil
+	}
+	keys := make(map[string]struct{}, len(entries))
+	for name := range entries {
+		keys[strings.ToLower(strings.TrimSpace(name))] = struct{}{}
+	}
+	return keys
+}
+
+// hasKey 报告集合是否包含 key（nil 集合视为空）。
+func hasKey(set map[string]struct{}, key string) bool {
+	if set == nil {
+		return false
+	}
+	_, ok := set[key]
+	return ok
+}
+
+// commitPricingBuild 把一次重建结果原子提交到内存（调用方不得持有 s.mu）。
+func (s *PricingService) commitPricingBuild(built *pricingBuild) {
+	if built == nil {
+		return
+	}
+	s.mu.Lock()
+	warnDroppedLongContextLadders(s.pricingData, built.data)
+	s.pricingData = built.data
+	s.pricingDataSources = built.sources
+	s.overrideModels = built.overrideModels
+	s.cnyModels = built.cnyModels
+	s.peakConfigs = built.peakConfigs
+	s.customFilesHash = built.fingerprint
+	s.mu.Unlock()
+}
+
+// HasManagedPricing 报告模型是否被管理员显式接管：override 文件存在该条目，
+// 或人民币层登记了该模型。DeepSeek 强制官方价策略据此让位，避免覆盖管理员配置。
+func (s *PricingService) HasManagedPricing(model string) bool {
+	if s == nil {
+		return false
+	}
+	model = strings.ToLower(strings.TrimSpace(model))
+	if model == "" {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if _, ok := s.overrideModels[model]; ok {
+		return true
+	}
+	_, ok := s.cnyModels[model]
+	return ok
+}
+
+// PeakPricingFor 返回模型的峰谷双价配置；未配置返回 (zero, false)。
+// 计费侧据此决定是否停用 DeepSeek 官方倍率并改用自定义峰谷价。
+func (s *PricingService) PeakPricingFor(model string) (PeakAwarePricing, bool) {
+	if s == nil {
+		return PeakAwarePricing{}, false
+	}
+	model = strings.ToLower(strings.TrimSpace(model))
+	if model == "" {
+		return PeakAwarePricing{}, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	peak, ok := s.peakConfigs[model]
+	if !ok || !peak.Enabled {
+		return PeakAwarePricing{}, false
+	}
+	return peak, true
+}
+
+// PeakPricingSettings 返回全局峰谷时段设置（未配置时按官方口径归一化后返回）。
+func (s *PricingService) PeakPricingSettings() PeakPricingSettings {
+	if s == nil {
+		return defaultPeakPricingSettings()
+	}
+	s.mu.RLock()
+	settings := s.peakSettings
+	s.mu.RUnlock()
+	return settings.Normalize()
+}
+
+// SetPeakPricingSettings 更新全局峰谷时段设置（管理端保存后调用，热生效）。
+func (s *PricingService) SetPeakPricingSettings(settings PeakPricingSettings) {
+	if s == nil {
+		return
+	}
+	normalized := settings.Normalize()
+	s.mu.Lock()
+	s.peakSettings = normalized
+	s.mu.Unlock()
+}
+
+// PricingSnapshot 是价格管理的只读快照：有效价（深拷贝）、逐模型来源与文件元数据。
+type PricingSnapshot struct {
+	// Models 是模型名 → 有效价（USD / token）的深拷贝，调用方可安全修改。
+	Models map[string]LiteLLMModelPricing
+	// Sources 是模型名 → 价格来源（litellm/fallback/override/cny）。
+	Sources map[string]string
+	// OverriddenModels 是 override 文件命中的模型集合（小写）。
+	OverriddenModels map[string]struct{}
+	// CNYModels 是人民币层登记的模型集合（小写）。
+	CNYModels map[string]struct{}
+	// ModelCount 是当前生效模型总数。
+	ModelCount int
+	// CatalogUpdatedAt 是目录缓存最近一次成功加载的时间。
+	CatalogUpdatedAt time.Time
+	// CatalogFile / OverrideFile / CNYOverrideFile 是各层文件路径（可能为空）。
+	CatalogFile     string
+	OverrideFile    string
+	CNYOverrideFile string
+	// CNYSettings 是人民币口径的生效模式与汇率。
+	CNYSettings CNYSettings
+}
+
+// Snapshot 返回当前生效价格的只读快照。价格结构为值类型，逐条复制即可深拷贝，
+// 调用方修改返回的 map 不会影响计费数据。
+func (s *PricingService) Snapshot() PricingSnapshot {
+	snapshot := PricingSnapshot{
+		Models:           make(map[string]LiteLLMModelPricing),
+		Sources:          make(map[string]string),
+		OverriddenModels: make(map[string]struct{}),
+		CNYModels:        make(map[string]struct{}),
+	}
+	if s == nil {
+		return snapshot
+	}
+
+	s.mu.RLock()
+	for name, pricing := range s.pricingData {
+		if pricing == nil {
+			continue
+		}
+		snapshot.Models[name] = *pricing
+	}
+	for name, source := range s.pricingDataSources {
+		snapshot.Sources[name] = source
+	}
+	for name := range s.overrideModels {
+		snapshot.OverriddenModels[name] = struct{}{}
+	}
+	for name := range s.cnyModels {
+		snapshot.CNYModels[name] = struct{}{}
+	}
+	snapshot.ModelCount = len(s.pricingData)
+	snapshot.CatalogUpdatedAt = s.lastUpdated
+	s.mu.RUnlock()
+
+	if s.cfg != nil {
+		snapshot.CatalogFile = s.getPricingFilePath()
+		snapshot.OverrideFile = strings.TrimSpace(s.cfg.Pricing.OverrideFile)
+	}
+	snapshot.CNYOverrideFile = s.EffectiveCNYOverrideFile()
+	snapshot.CNYSettings = s.CurrentCNYSettings()
+	return snapshot
 }
 
 // loadPricingData 从本地文件加载价格数据
@@ -1086,7 +1667,7 @@ func (s *PricingService) loadPricingData(filePath string) error {
 		return fmt.Errorf("read file failed: %w", err)
 	}
 
-	pricingData, customFilesHash, err := s.buildPricingData(data)
+	built, err := s.buildPricingData(data)
 	if err != nil {
 		return fmt.Errorf("parse pricing data: %w", err)
 	}
@@ -1096,10 +1677,14 @@ func (s *PricingService) loadPricingData(filePath string) error {
 	hashStr := hex.EncodeToString(hash[:])
 
 	s.mu.Lock()
-	warnDroppedLongContextLadders(s.pricingData, pricingData)
-	s.pricingData = pricingData
+	warnDroppedLongContextLadders(s.pricingData, built.data)
+	s.pricingData = built.data
+	s.pricingDataSources = built.sources
+	s.overrideModels = built.overrideModels
+	s.cnyModels = built.cnyModels
+	s.peakConfigs = built.peakConfigs
 	s.localHash = hashStr
-	s.customFilesHash = customFilesHash
+	s.customFilesHash = built.fingerprint
 
 	info, _ := os.Stat(filePath)
 	if info != nil {
@@ -1109,7 +1694,7 @@ func (s *PricingService) loadPricingData(filePath string) error {
 	}
 	s.mu.Unlock()
 
-	logger.LegacyPrintf("service.pricing", "[Pricing] Loaded %d models from %s", len(pricingData), filePath)
+	logger.LegacyPrintf("service.pricing", "[Pricing] Loaded %d models from %s", len(built.data), filePath)
 	return nil
 }
 

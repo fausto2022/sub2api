@@ -43,6 +43,10 @@ type AdminHandlers struct {
 	Affiliate              *admin.AffiliateHandler
 	Compliance             *admin.ComplianceHandler
 	AuditLog               *admin.AuditLogHandler
+	Ticket                 *admin.TicketHandler
+	ModelPricing           *admin.ModelPricingHandler
+	// OpsMgmt 运营管理（上游对接 / 利润保护 / 扩池 / 看板），与可观测性 Ops 无关。
+	OpsMgmt *admin.OpsMgmtHandler
 }
 
 // Handlers contains all HTTP handlers
@@ -69,6 +73,8 @@ type Handlers struct {
 	ModelPlaza       *ModelPlazaHandler
 	AsyncImage       *AsyncImageHandler
 	BatchImage       *BatchImageHandler
+	Ticket           *TicketHandler
+	TicketAttachment *TicketAttachmentHandler
 }
 
 // BuildInfo contains build-time information

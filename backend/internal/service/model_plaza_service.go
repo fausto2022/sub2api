@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 )
@@ -22,9 +23,19 @@ type PlazaOfficialPricing struct {
 
 // PlazaModel 模型广场中单个模型条目：按实收口径合成的展示定价 + 官方参考价。
 type PlazaModel struct {
-	Name            string
-	Platform        string
-	Pricing         *ChannelModelPricing
+	Name     string
+	Platform string
+	// CatalogPricing 管理员在「模型价格」页配置的目录价（USD per token，未乘倍率）。
+	// 仅当该模型被目录价层接管（override 条目带 `_catalog` 元数据且可计价）时给出；
+	// 为 nil 表示该模型未纳入目录价，前端回落到 Pricing 展示。
+	CatalogPricing *ChannelModelPricing
+	// Pricing 实收单价（已按计费同源口径合成；目录价接管时即目录价，仍未乘分组倍率）。
+	Pricing *ChannelModelPricing
+	// DiscountedPricing 折后价 = Pricing × 生效分组倍率，仅 token 计费模式给出。
+	// 分量与 Pricing 对应（输入/输出/缓存读写、阶梯逐档），前端可直接展示而无需再乘倍率。
+	DiscountedPricing *ChannelModelPricing
+	// PeakPricing 模型级自定义高峰价（USD per token，未乘倍率）；未启用峰谷时为 nil。
+	PeakPricing     *PlazaOfficialPricing
 	OfficialPricing *PlazaOfficialPricing
 	// LongContextBasis 多档时的计价基准（整单 / 仅超出部分），单档为空。
 	LongContextBasis ContextPricingBasis
@@ -59,7 +70,10 @@ type PlazaGroup struct {
 	VideoRateMultiplier  float64
 	// LongContextPricingEnabled 分组是否按上下文长度应用阶梯价；关闭时模型展示的是最低档。
 	LongContextPricingEnabled bool
-	Models                    []PlazaModel
+	// CatalogModelCount 该分组中价格来自模型目录价层（`_catalog` 接管）的模型数量。
+	// 用于前端标注「本组 N 个模型按目录价计价」，未接管模型不计入。
+	CatalogModelCount int
+	Models            []PlazaModel
 }
 
 // ModelPlazaService 聚合模型广场数据。
@@ -215,6 +229,15 @@ func (s *ModelPlazaService) ListGroups(ctx context.Context) ([]PlazaGroup, error
 		for j := range pg.Models {
 			s.fillDisplayPricing(ctx, &pg.Models[j], g)
 			pg.Models[j].OfficialPricing = s.lookupOfficialPricing(ctx, pg.Models[j].Name, officialMemo)
+			// 折后价 = 展示单价 × 分组默认生效倍率（design.md §4.3）。
+			// 用户专属倍率在 handler 层按登录态覆盖，见 PlazaDiscountedPricing。
+			pg.Models[j].DiscountedPricing = PlazaDiscountedPricing(
+				pg.Models[j].Pricing,
+				PlazaGroupEffectiveRate(pg, plazaBillingModeOf(pg.Models[j].Pricing), nil),
+			)
+			if pg.Models[j].CatalogPricing != nil {
+				pg.CatalogModelCount++
+			}
 		}
 		out = append(out, *pg)
 	}
@@ -231,14 +254,28 @@ func (s *ModelPlazaService) ListGroups(ctx context.Context) ([]PlazaGroup, error
 // fillDisplayPricing 把模型的展示定价换成实收口径：
 // token 模型取计费阶梯表（单价与档位均由真实计费函数得出），
 // 图片/按次模型（或阶梯表不可用时）沿用渠道定价与分组图片档位价。
+//
+// 目录价优先（design.md §3.3/§3.4）：模型被「模型价格」页的目录价层接管时，
+// 展示价与计费同源直接取目录价，分组模型级固定价不再参与（resolver 的目录价层
+// 优先级最高，计费同样会跳过分组卡）。目录价层开关关闭时不接管，回退旧口径。
 func (s *ModelPlazaService) fillDisplayPricing(ctx context.Context, m *PlazaModel, g *Group) {
-	if groupPricing := matchGroupModelPricing(g, m.Name); groupPricing != nil {
+	catalogPricing, catalogPeak := s.catalogDisplayPricing(m.Name)
+	m.CatalogPricing = catalogPricing
+	m.PeakPricing = catalogPeak
+
+	if catalogPricing != nil {
+		m.Pricing = catalogPricing
+	} else if groupPricing := matchGroupModelPricing(g, m.Name); groupPricing != nil {
 		m.Pricing = groupPricing
 		// 分组模型级固定价就是实收价，不能再被分组图片兜底档位覆盖。
 		// 否则模型广场会显示 image_price_1k/2k/4k，而实际按 model_pricing 扣费。
 		if groupPricing.BillingMode == BillingModeImage || groupPricing.BillingMode == BillingModePerRequest {
 			return
 		}
+	}
+	if catalogPricing != nil && catalogPricing.BillingMode != BillingModeToken {
+		// 目录价给出的是按次/图片档位价，阶梯探针不适用。
+		return
 	}
 	if s.billingService != nil && s.resolver != nil {
 		sched, err := s.billingService.ResolveContextPricingSchedule(ctx, s.resolver, ContextPricingScheduleInput{
@@ -255,7 +292,184 @@ func (s *ModelPlazaService) fillDisplayPricing(ctx context.Context, m *PlazaMode
 			return
 		}
 	}
+	if catalogPricing != nil {
+		// 目录价已给出单价，不再套用分组图片兜底档位。
+		return
+	}
 	m.Pricing = plazaImageDisplayPricing(m.Pricing, g)
+}
+
+// catalogDisplayPricing 返回模型在目录价层的展示价与高峰价。
+//
+// 与计费同源：直接复用 resolver 的目录价层解析（`_catalog` 元数据 + 目录价层开关 +
+// 基础价表回退），因此广场展示的目录价与实际扣费价一致。返回 nil 表示该模型未被
+// 目录价层接管（未配置 `_catalog`、开关关闭、或条目没有任何可计价字段）。
+func (s *ModelPlazaService) catalogDisplayPricing(model string) (*ChannelModelPricing, *PlazaOfficialPricing) {
+	if s == nil || s.resolver == nil || s.resolver.billingService == nil || model == "" {
+		return nil, nil
+	}
+	resolved := s.resolver.resolveCatalogPricing(model)
+	if resolved == nil || resolved.BasePricing == nil {
+		return nil, nil
+	}
+	pricing := plazaPricingFromModelPricing(resolved.BasePricing)
+	if !plazaHasTokenPrice(pricing) {
+		pricing = nil
+	}
+	peak := plazaPeakPricingFromAware(resolved.peakAware, resolved.BasePricing)
+	if pricing == nil && peak == nil {
+		return nil, nil
+	}
+	return pricing, peak
+}
+
+// plazaPricingFromModelPricing 把计费侧的 per-token 价格转换成广场展示价；
+// 0 值按「未配置」处理（与官方参考价口径一致）。
+func plazaPricingFromModelPricing(mp *ModelPricing) *ChannelModelPricing {
+	if mp == nil {
+		return nil
+	}
+	out := &ChannelModelPricing{
+		BillingMode:                BillingModeToken,
+		InputPrice:                 nonZeroPtr(mp.InputPricePerToken),
+		OutputPrice:                nonZeroPtr(mp.OutputPricePerToken),
+		CacheWritePrice:            nonZeroPtr(mp.CacheCreationPricePerToken),
+		CacheReadPrice:             nonZeroPtr(mp.CacheReadPricePerToken),
+		ImageInputPrice:            nonZeroPtr(mp.ImageInputPricePerToken),
+		ReasoningEffortMultipliers: maps.Clone(mp.ReasoningEffortMultipliers),
+	}
+	// 与官方参考价一致：只有支持 5m/1h 分档时才展示 1h 价。
+	if mp.SupportsCacheBreakdown {
+		out.CacheWrite1hPrice = nonZeroPtr(mp.CacheCreation1hPrice)
+	}
+	if mp.CacheCreation12hPricePerToken != nil {
+		out.CacheWrite12hPrice = nonZeroPtr(*mp.CacheCreation12hPricePerToken)
+	}
+	return out
+}
+
+// plazaHasTokenPrice 报告展示价是否至少有一个可展示的 token 单价。
+func plazaHasTokenPrice(p *ChannelModelPricing) bool {
+	if p == nil {
+		return false
+	}
+	return p.InputPrice != nil || p.OutputPrice != nil || p.CacheWritePrice != nil ||
+		p.CacheWrite1hPrice != nil || p.CacheWrite12hPrice != nil || p.CacheReadPrice != nil
+}
+
+// plazaPeakPricingFromAware 把模型级峰谷配置转换成广场展示用的高峰价。
+//
+// 回落规则与计费侧 ResolvePeakPricing 一致（design.md §0.5）：
+//   - 只填峰价 → 峰价生效；
+//   - 只填谷价 → 峰价 = 谷价 × 2（保持官方倍率语义）；
+//   - 谷价留空 → 谷价回落基础价，峰价缺省时同样按谷价 × 2 推导。
+//
+// 未启用峰谷或推导不出任何峰价时返回 nil（前端隐藏该列）。
+func plazaPeakPricingFromAware(peak PeakAwarePricing, base *ModelPricing) *PlazaOfficialPricing {
+	if !peak.Enabled {
+		return nil
+	}
+	offPeak := peak.OffPeak
+	if offPeak.IsZero() {
+		if base == nil {
+			return nil
+		}
+		offPeak = PeakPricingAmounts{
+			Input:      base.InputPricePerToken,
+			Output:     base.OutputPricePerToken,
+			CacheRead:  base.CacheReadPricePerToken,
+			CacheWrite: base.CacheCreationPricePerToken,
+		}
+	}
+	high := peak.Peak
+	if high.IsZero() {
+		high = PeakPricingAmounts{
+			Input:      offPeak.Input * 2,
+			Output:     offPeak.Output * 2,
+			CacheRead:  offPeak.CacheRead * 2,
+			CacheWrite: offPeak.CacheWrite * 2,
+		}
+	}
+	if high.IsZero() {
+		return nil
+	}
+	return &PlazaOfficialPricing{
+		InputPrice:      nonZeroPtr(high.Input),
+		OutputPrice:     nonZeroPtr(high.Output),
+		CacheWritePrice: nonZeroPtr(high.CacheWrite),
+		CacheReadPrice:  nonZeroPtr(high.CacheRead),
+	}
+}
+
+// PlazaGroupEffectiveRate 返回模型在该分组下实际生效的展示倍率。
+//
+// 与计费口径一致：图片/视频独立倍率开启时取独立倍率（不乘分组/用户专属倍率），
+// 否则用户专属倍率优先，未配置时回退分组默认倍率。
+func PlazaGroupEffectiveRate(g *PlazaGroup, mode BillingMode, userRate *float64) float64 {
+	if g == nil {
+		return 1
+	}
+	switch mode {
+	case BillingModeImage:
+		if g.ImageRateIndependent {
+			return g.ImageRateMultiplier
+		}
+	case BillingModeVideo:
+		if g.VideoRateIndependent {
+			return g.VideoRateMultiplier
+		}
+	}
+	if userRate != nil {
+		return *userRate
+	}
+	return g.RateMultiplier
+}
+
+// PlazaDiscountedPricing 返回折后价 = 展示单价 × 生效倍率（design.md §4.3）。
+//
+// 入参与返回都是未乘倍率的展示口径之外的新结构，不修改入参。目录价/实收价、
+// 阶梯逐档单价全部按同一倍率折算，便于前端直接展示「折后价」列。
+func PlazaDiscountedPricing(p *ChannelModelPricing, rate float64) *ChannelModelPricing {
+	if p == nil {
+		return nil
+	}
+	out := p.Clone()
+	out.InputPrice = scalePricePtr(out.InputPrice, rate)
+	out.OutputPrice = scalePricePtr(out.OutputPrice, rate)
+	out.CacheWritePrice = scalePricePtr(out.CacheWritePrice, rate)
+	out.CacheWrite1hPrice = scalePricePtr(out.CacheWrite1hPrice, rate)
+	out.CacheWrite12hPrice = scalePricePtr(out.CacheWrite12hPrice, rate)
+	out.CacheReadPrice = scalePricePtr(out.CacheReadPrice, rate)
+	out.ImageInputPrice = scalePricePtr(out.ImageInputPrice, rate)
+	out.ImageOutputPrice = scalePricePtr(out.ImageOutputPrice, rate)
+	out.PerRequestPrice = scalePricePtr(out.PerRequestPrice, rate)
+	for i := range out.Intervals {
+		out.Intervals[i].InputPrice = scalePricePtr(out.Intervals[i].InputPrice, rate)
+		out.Intervals[i].OutputPrice = scalePricePtr(out.Intervals[i].OutputPrice, rate)
+		out.Intervals[i].CacheWritePrice = scalePricePtr(out.Intervals[i].CacheWritePrice, rate)
+		out.Intervals[i].CacheWrite1hPrice = scalePricePtr(out.Intervals[i].CacheWrite1hPrice, rate)
+		out.Intervals[i].CacheWrite12hPrice = scalePricePtr(out.Intervals[i].CacheWrite12hPrice, rate)
+		out.Intervals[i].CacheReadPrice = scalePricePtr(out.Intervals[i].CacheReadPrice, rate)
+		out.Intervals[i].PerRequestPrice = scalePricePtr(out.Intervals[i].PerRequestPrice, rate)
+	}
+	return &out
+}
+
+// scalePricePtr 按倍率折算单价；nil 透传（未配置保持未配置）。
+func scalePricePtr(p *float64, rate float64) *float64 {
+	if p == nil {
+		return nil
+	}
+	value := *p * rate
+	return &value
+}
+
+// plazaBillingModeOf 返回展示定价的计费模式，空值按 token 处理。
+func plazaBillingModeOf(p *ChannelModelPricing) BillingMode {
+	if p == nil || p.BillingMode == "" {
+		return BillingModeToken
+	}
+	return p.BillingMode
 }
 
 // plazaPricingFromSchedule 把阶梯表压成展示用的 ChannelModelPricing：

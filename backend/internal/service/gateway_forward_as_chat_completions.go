@@ -158,7 +158,7 @@ func (s *GatewayService) ForwardAsChatCompletions(
 		// Apply account policies even for statuses outside the default failover list.
 		shouldDisable := false
 		if s.rateLimitService != nil {
-			shouldDisable = s.rateLimitService.HandleUpstreamError(ctx, account, resp.StatusCode, resp.Header, respBody, mappedModel)
+			shouldDisable = s.handleRateLimitFailure(ctx, account, resp.StatusCode, resp.Header, respBody, mappedModel)
 		}
 		if shouldDisable || s.shouldFailoverUpstreamError(resp.StatusCode) {
 			appendOpsUpstreamError(c, OpsUpstreamErrorEvent{

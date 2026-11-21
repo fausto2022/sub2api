@@ -1073,7 +1073,7 @@ func buildErrorWhere(filter *service.OpsDashboardFilter, start, end time.Time, s
 	clauses = append(clauses, fmt.Sprintf("created_at < $%d", idx))
 	idx++
 
-	clauses = append(clauses, "is_count_tokens = FALSE")
+	clauses = append(clauses, "is_count_tokens = FALSE", opsLegacyErrorRows)
 
 	if groupID != nil && *groupID > 0 {
 		args = append(args, *groupID)

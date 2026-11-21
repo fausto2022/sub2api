@@ -738,7 +738,7 @@ func (s *GeminiMessagesCompatService) Forward(ctx context.Context, c *gin.Contex
 		}
 		requestIDHeader = idHeader
 
-		resp, err = s.httpUpstream.Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
+		resp, err = (failoverAttemptUpstream{s.httpUpstream}).Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
 		if err != nil {
 			return nil, s.handleUpstreamTransportError(ctx, c, account, err)
 		}
@@ -801,7 +801,9 @@ func (s *GeminiMessagesCompatService) Forward(ctx context.Context, c *gin.Contex
 					logger.LegacyPrintf("service.gemini_messages_compat", "Gemini account %d: detected signature-related 400, retrying with downgraded Claude blocks (%s)", account.ID, stageName)
 					// 降级只改写历史块，思考参数沿用客户端原始请求。
 					geminiReq = applyGeminiCompatThinkingConfig(retryGeminiReq, originalClaudeBody, mappedModel, includeThoughts)
-					sleepGeminiBackoff(1)
+					if err := sleepWithContext(ctx, geminiBackoffDelay(1)); err != nil {
+						return nil, err
+					}
 					continue
 				}
 			}
@@ -869,7 +871,9 @@ func (s *GeminiMessagesCompatService) Forward(ctx context.Context, c *gin.Contex
 				})
 
 				logger.LegacyPrintf("service.gemini_messages_compat", "Gemini account %d: upstream status %d, retry %d/%d", account.ID, resp.StatusCode, retryAttempt, maxAttempts)
-				sleepGeminiBackoff(retryAttempt)
+				if err := sleepWithContext(ctx, geminiBackoffDelay(retryAttempt)); err != nil {
+					return nil, err
+				}
 				continue
 			}
 			// Final attempt: surface the upstream error body (mapped below) instead of a generic retry error.
@@ -1291,7 +1295,7 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
 		}
 		requestIDHeader = idHeader
 
-		resp, err = s.httpUpstream.Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
+		resp, err = (failoverAttemptUpstream{s.httpUpstream}).Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
 		if err != nil {
 			transportErr := s.handleUpstreamTransportError(ctx, c, account, err)
 			// countTokens 不因上游链路故障而失败：本地估算兜底，不换号。
@@ -1373,7 +1377,9 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
 				})
 
 				logger.LegacyPrintf("service.gemini_messages_compat", "Gemini account %d: upstream status %d, retry %d/%d", account.ID, resp.StatusCode, attempt, maxAttempts)
-				sleepGeminiBackoff(attempt)
+				if err := sleepWithContext(ctx, geminiBackoffDelay(attempt)); err != nil {
+					return nil, err
+				}
 				continue
 			}
 			if action == "countTokens" {
@@ -1703,13 +1709,18 @@ func (s *GeminiMessagesCompatService) shouldRetryGeminiUpstreamError(account *Ac
 	}
 }
 
+// shouldFailoverGeminiUpstreamError 判断是否应换到下一个账号。
+//
+// P1/T1.1：判定收敛到 ClassifyUpstreamFailure（failover_classifier.go），这里只声明
+// Gemini 网关族；旧集合 {401,403,429,529} ∪ [500,∞) 由分类器的默认规则表复现，
+// 逐值等价由 failover_legacy_equivalence_test.go 双跑锁定。
+//
+// 注意：同账号重试集合（shouldRetryGeminiUpstreamError，上方的 {429,500,502,503,504,529}）
+// 不在本轮接线范围——分类器给的是「同账号重试模式」（inherit/off），不是状态码集合，
+// 用它替换会改变 4xx 的同账号重试语义（违反 P1 零行为变更）；该集合在 T2.2 的
+// 决策引擎里与失败类别一起收敛。
 func (s *GeminiMessagesCompatService) shouldFailoverGeminiUpstreamError(statusCode int) bool {
-	switch statusCode {
-	case 401, 403, 429, 529:
-		return true
-	default:
-		return statusCode >= 500
-	}
+	return shouldFailoverStatus(statusCode, FailoverProfileGemini)
 }
 
 // skippedErrorPolicyFailoverError 命中 ErrorPolicySkipped（池模式、或自定义错误码未命中）
@@ -1868,6 +1879,10 @@ func (s *GeminiMessagesCompatService) recordGeminiNativeUpstreamError(c *gin.Con
 }
 
 func sleepGeminiBackoff(attempt int) {
+	time.Sleep(geminiBackoffDelay(attempt))
+}
+
+func geminiBackoffDelay(attempt int) time.Duration {
 	delay := geminiRetryBaseDelay * time.Duration(1<<uint(attempt-1))
 	if delay > geminiRetryMaxDelay {
 		delay = geminiRetryMaxDelay
@@ -1880,7 +1895,7 @@ func sleepGeminiBackoff(attempt int) {
 	if sleepFor < 0 {
 		sleepFor = 0
 	}
-	time.Sleep(sleepFor)
+	return sleepFor
 }
 
 var (
@@ -3157,6 +3172,11 @@ func asInt(v any) (int, bool) {
 }
 
 func (s *GeminiMessagesCompatService) handleGeminiUpstreamError(ctx context.Context, account *Account, statusCode int, headers http.Header, body []byte) {
+	if account != nil && HTTPFailoverMutationEnabled(ctx) {
+		h, b := headers.Clone(), append([]byte(nil), body...)
+		DeferFailoverMutation(ctx, account.ID, "account", func(writeCtx context.Context) { s.handleGeminiUpstreamError(writeCtx, account, statusCode, h, b) })
+		return
+	}
 	// 遵守自定义错误码策略：未命中则跳过所有限流处理
 	if !account.ShouldHandleErrorCode(statusCode) {
 		return

@@ -133,6 +133,8 @@ deploy/docker-compose.override.yml
 .gocache/
 vite.config.js
 docs/*
+!docs/design/
+!docs/design/*.html
 !docs/agent-resource-safety.md
 !docs/moego-json-batching.md
 !docs/admin-api-keys.md
@@ -166,3 +168,6 @@ issues/
 .vite/
 # 本地闭源插件开发目录及构建产物不进入 Sub2API 仓库
 /plugins/
+
+# AgentTeams 运行时状态（含 team.json 等会话产物，不进入仓库）
+.agent-teams/

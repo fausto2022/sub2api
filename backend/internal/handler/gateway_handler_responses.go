@@ -21,6 +21,8 @@ import (
 // This converts Responses API requests to Anthropic format, forwards to Anthropic
 // upstream, and converts responses back to Responses format.
 func (h *GatewayHandler) Responses(c *gin.Context) {
+	installCostAttemptAudit(c, h.upstreamCostRecorder)
+	defer finishFailoverObservation(c)
 	streamStarted := false
 
 	requestStart := time.Now()
@@ -36,6 +38,7 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 		h.responsesErrorResponse(c, http.StatusInternalServerError, "api_error", "User context not found")
 		return
 	}
+	defer h.installFailoverRouting(c)()
 	reqLog := requestLogger(
 		c,
 		"handler.gateway.responses",
@@ -60,6 +63,7 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 		return
 	}
 
+	captureFailoverIdempotencyInput(c, body)
 	setOpsRequestContext(c, "", false)
 
 	// Validate JSON
@@ -185,16 +189,25 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 	sessionHash := h.gatewayService.GenerateSessionHash(parsedReq)
 
 	// 3. Account selection + failover loop
-	fs := NewFailoverState(h.maxAccountSwitches, false)
+	fs := h.newGroupFailoverState(c, apiKey.GroupID, h.maxAccountSwitches, false)
+	requestCtx = service.ContextWithResolvedGatewayFailoverPolicy(requestCtx, c.Request.Context())
 
 	for {
 		if failoverClientGone(c) {
 			return
 		}
-		selection, err := h.gatewayService.SelectAccountWithLoadAwareness(requestCtx, apiKey.GroupID, sessionHash, reqModel, fs.FailedAccountIDs, "", int64(0))
+		selection, err := fs.selectGatewayAccount(requestCtx, h.gatewayService, apiKey.GroupID, sessionHash, reqModel, fs.selectionExclusions(), "", int64(0))
 		if err != nil {
 			if failoverClientGone(c) {
 				reqLog.Info("gateway.responses.account_select_aborted_client_disconnected", zap.Error(err))
+				return
+			}
+			if errors.Is(err, errFailoverRetrySelectionExhausted) {
+				if fs.Outcome != nil {
+					h.handleFailoverBudgetExhausted(c, fs.Outcome, streamStarted)
+				} else {
+					h.handleResponsesFailoverExhausted(c, fs.LastFailoverErr, streamStarted)
+				}
 				return
 			}
 			if len(fs.FailedAccountIDs) == 0 {
@@ -225,6 +238,10 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 				}
 				return
 			}
+		}
+		if fs.rejectIdempotencyRetrySelection(c.Request.Context(), selection) {
+			h.handleResponsesFailoverExhausted(c, fs.LastFailoverErr, streamStarted)
+			return
 		}
 		account := selection.Account
 		setOpsSelectedAccount(c, account.ID, account.Platform)
@@ -270,6 +287,10 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 		}
 		account = latest
 		selection.Account = latest
+		if !fs.admitIsolation(admissionCtx, selection, accountReleaseFunc) {
+			h.gatewayService.ReleaseAccountSession(context.WithoutCancel(admissionCtx), account, sessionHash)
+			continue
+		}
 		if selection.ProfitGateActive() {
 			if err := h.gatewayService.BindStickySessionAfterProfitAdmission(admissionCtx, apiKey.GroupID, sessionHash, account.ID); err != nil {
 				reqLog.Warn("gateway.responses.bind_sticky_session_after_profit_admission_failed", zap.Int64("account_id", account.ID), zap.Error(err))
@@ -284,9 +305,12 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 			forwardBody = h.gatewayService.ReplaceModelInBody(body, channelMapping.MappedModel)
 		}
 		var result *service.ForwardResult
+		fs.observeForward(c, account, apiKey.GroupID, reqModel)
+		forwardCtx, finishBudget := fs.beginForward(requestCtx, c, reqStream, 0)
 		setActualUpstreamEndpoint(c, "")
 		if shouldUseAntigravityCompat(account) {
 			if h.antigravityGatewayService == nil {
+				_ = finishBudget()
 				h.responsesErrorResponse(c, http.StatusBadGateway, "upstream_error", "Antigravity compatibility service is not configured")
 				if accountReleaseFunc != nil {
 					accountReleaseFunc()
@@ -294,13 +318,19 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 				return
 			}
 			setActualUpstreamEndpoint(c, EndpointAntigravityGenerateContent)
-			result, err = h.antigravityGatewayService.ForwardAsResponses(requestCtx, c, account, forwardBody, parsedReq)
+			result, err = h.antigravityGatewayService.ForwardAsResponses(forwardCtx, c, account, forwardBody, parsedReq)
 		} else {
-			result, err = h.gatewayService.ForwardAsResponses(requestCtx, c, account, forwardBody, parsedReq)
+			result, err = h.gatewayService.ForwardAsResponses(forwardCtx, c, account, forwardBody, parsedReq)
 		}
 
+		err = fs.applyForwardBudgetError(err, finishBudget())
+		gatewayIsolationFrom(c.Request.Context()).recordForward(c.Request.Context(), result, err, c.Writer.Size() == writerSizeBeforeForward)
 		if accountReleaseFunc != nil {
 			accountReleaseFunc()
+		}
+
+		if h.upstreamCostRecorder != nil {
+			recordGatewayForwardCost(c, result, err)
 		}
 
 		// 提交 usage 记录。成功路径与"流中断但 Forward 已观测到 usage 的部分结果"
@@ -387,16 +417,21 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 
 // responsesErrorResponse writes an error in OpenAI Responses API format.
 func (h *GatewayHandler) responsesErrorResponse(c *gin.Context, status int, code, message string) {
-	c.JSON(status, gin.H{
-		"error": gin.H{
-			"code":    code,
-			"message": message,
-		},
-	})
+	object := gin.H{
+		"code":    code,
+		"message": message,
+	}
+	addFailoverTerminalFields(c, object)
+	c.JSON(status, gin.H{"error": object})
 }
 
 // handleResponsesFailoverExhausted writes a failover-exhausted error in Responses format.
 func (h *GatewayHandler) handleResponsesFailoverExhausted(c *gin.Context, lastErr *service.UpstreamFailoverError, streamStarted bool) {
+	lastStatus := 0
+	if lastErr != nil {
+		lastStatus = lastErr.StatusCode
+	}
+	prepareFailoverTerminal(c, lastStatus, "accounts", h.cfg)
 	if lastErr != nil {
 		copyFailoverRetryAfter(c, lastErr.ResponseHeaders)
 	}
@@ -416,6 +451,8 @@ func (h *GatewayHandler) handleResponsesFailoverExhausted(c *gin.Context, lastEr
 	} else if lastErr != nil && service.IsOpenAISilentRefusalErrorBody(lastErr.ResponseBody) {
 		service.SetOpsUpstreamError(c, statusCode, service.OpenAISilentRefusalClientMessage(), "")
 		status, code, message = http.StatusBadGateway, "upstream_error", service.OpenAISilentRefusalClientMessage()
+	} else if mixedFailoverStatus(c, h.cfg) {
+		status = http.StatusServiceUnavailable
 	} else if lastErr != nil && statusCode == http.StatusTooManyRequests {
 		status, code, message = http.StatusTooManyRequests, "rate_limit_error", "All available accounts are currently rate-limited. Please retry later."
 	}

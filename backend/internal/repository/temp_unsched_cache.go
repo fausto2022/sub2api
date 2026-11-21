@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -63,6 +64,33 @@ type tempUnschedCache struct {
 
 func NewTempUnschedCache(rdb *redis.Client) service.TempUnschedCache {
 	return &tempUnschedCache{rdb: rdb}
+}
+
+const overloadWriteDebouncePrefix = "failover:overload:write:"
+
+var releaseOverloadWriteScript = redis.NewScript(`
+	if redis.call('GET', KEYS[1]) == ARGV[1] then
+		return redis.call('DEL', KEYS[1])
+	end
+	return 0
+`)
+
+// TryAcquireOverloadWrite shares a short write window across gateway instances.
+// The returned release function is for failed writes and only clears its own key.
+func (c *tempUnschedCache) TryAcquireOverloadWrite(ctx context.Context, accountID int64, window time.Duration) (bool, func(context.Context) error, error) {
+	key := fmt.Sprintf("%s%d", overloadWriteDebouncePrefix, accountID)
+	token, err := uuid.NewRandom()
+	if err != nil {
+		return false, nil, err
+	}
+	value := token.String()
+	acquired, err := c.rdb.SetNX(ctx, key, value, window).Result()
+	if err != nil || !acquired {
+		return false, nil, err
+	}
+	return true, func(ctx context.Context) error {
+		return releaseOverloadWriteScript.Run(ctx, c.rdb, []string{key}, value).Err()
+	}, nil
 }
 
 // SetTempUnsched 设置临时不可调度状态（只延长不缩短）

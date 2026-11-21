@@ -1,0 +1,970 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>sub2api · UI 配色三方向预览（方向 B 靛青为默认）</title>
+<style>
+  /* ===== 基础 =====
+     纯静态、零外部依赖：不引用任何字体 CDN / 图片 / 脚本。字体走系统栈。 */
+  :root {
+    --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+      "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", Arial, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    --radius-md: 6px;
+    --radius-lg: 8px;
+    --radius-xl: 12px;
+    --radius-2xl: 16px;
+    --radius-3xl: 24px;
+  }
+  * { box-sizing: border-box; }
+  html { background: #eceef4; }
+  body {
+    margin: 0;
+    font-family: var(--font-sans);
+    color: #0f172a;
+    background: #eceef4;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  code, .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 0 20px 72px; }
+  h1, h2, h3, h4 { margin: 0; line-height: 1.3; }
+  h1 { font-size: 28px; font-weight: 750; }
+  h2 { font-size: 20px; font-weight: 700; }
+  h3 { font-size: 15px; font-weight: 650; }
+  p { margin: 6px 0 0; }
+  .muted { color: #475569; font-size: 13px; }
+  .tiny { font-size: 12px; color: #64748b; }
+
+  /* ===== 页头 ===== */
+  .page-head {
+    background: linear-gradient(135deg, #101528 0%, #070b14 60%, #0b1120 100%);
+    color: #e2e7f0;
+    padding: 40px 20px 34px;
+    border-bottom: 1px solid #1e2740;
+  }
+  .page-head .wrap { padding-bottom: 0; }
+  .kicker {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-size: 12px; letter-spacing: .08em; text-transform: uppercase;
+    color: #a5b4fc;
+  }
+  .kicker .dot { width: 8px; height: 8px; border-radius: 999px; background: #6366f1; box-shadow: 0 0 10px rgba(99,102,241,.8); }
+  .page-head h1 { margin-top: 10px; color: #f5f7fb; }
+  .page-head .lead { margin-top: 10px; max-width: 780px; color: #c3ccdc; font-size: 14px; }
+  .meta { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
+  .meta span {
+    font-size: 12px; padding: 4px 10px; border-radius: 999px;
+    background: rgba(255,255,255,.06); border: 1px solid #2c3852; color: #c3ccdc;
+  }
+
+  /* ===== 章节 ===== */
+  section { margin-top: 44px; }
+  .section-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+  .section-head .idx {
+    font-family: var(--font-mono); font-size: 12px; color: #4f46e5;
+    background: #eef2ff; border: 1px solid #c7d2fe; border-radius: 6px; padding: 1px 7px;
+  }
+  .panel {
+    background: #fff; border: 1px solid #e2e8f0; border-radius: 16px;
+    box-shadow: 0 1px 3px rgba(7,11,20,.04), 0 1px 2px rgba(7,11,20,.06);
+    padding: 20px;
+  }
+
+  /* ===== 三方向卡 ===== */
+  .dir-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+  .dir-card { padding: 0; overflow: hidden; }
+  .dir-head { padding: 16px 18px 12px; border-bottom: 1px solid; display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; }
+  .dir-head .tag {
+    font-size: 11px; font-weight: 700; letter-spacing: .04em; padding: 3px 8px; border-radius: 999px;
+    background: var(--brand-50); color: var(--brand-700); border: 1px solid var(--brand-200);
+  }
+  .dir-head .tag.default { background: var(--brand-600); color: #fff; border-color: var(--brand-600); }
+  .dir-body { padding: 16px 18px 18px; }
+  .dir-note { font-size: 12px; color: var(--text-2); margin-top: 10px; }
+
+  /* ===== 主题变量（三方向各自一套，页面内可混排） ===== */
+  .theme {
+    --canvas: #f6f7fb; --surface: #fff; --surface-2: #f1f5f9;
+    --border: #e2e8f0; --border-strong: #cbd5e1;
+    --text: #0f172a; --text-2: #475569; --text-3: #64748b;
+    --ring: #6366f1; --selection: rgba(99,102,241,.22);
+    background: var(--canvas); color: var(--text);
+  }
+  .dir-a {
+    --brand-50:#effcf8; --brand-100:#d7f7ef; --brand-200:#b0eee1; --brand-300:#7fe0cf;
+    --brand-400:#46c9b5; --brand-500:#17a88a; --brand-600:#0c8a73; --brand-700:#0c6e5d;
+    --brand-800:#0b5a4c; --brand-900:#0a4a3f; --brand-950:#052620;
+    --accent:#0284c7; --ok:#059669; --warn:#d97706; --danger:#dc2626;
+    --fill-a:#0a7f6a; --fill-b:#0c6e5d; /* 白字 ≥4.5 的实心档（原 600 仅 4.29） */
+  }
+  .dir-a .dir-head { border-color: var(--border); }
+  .dir-a.is-dark, .dir-a.dark-sample {
+    --canvas:#06110f; --surface:#0c1a17; --surface-2:#0a1614;
+    --border:#1b2e29; --border-strong:#28453e;
+    --text:#e6f2ef; --text-2:#a9c4be; --text-3:#7c9a94;
+    --ring:#5eead4; --selection:rgba(23,168,138,.35);
+  }
+  .dir-b {
+    --brand-50:#eef2ff; --brand-100:#e0e7ff; --brand-200:#c7d2fe; --brand-300:#a5b4fc;
+    --brand-400:#818cf8; --brand-500:#6366f1; --brand-600:#4f46e5; --brand-700:#4338ca;
+    --brand-800:#3730a3; --brand-900:#312e81; --brand-950:#1e1b4b;
+    --accent:#06b6d4; --ok:#10b981; --warn:#f59e0b; --danger:#ef4444;
+    --fill-a:#4f46e5; --fill-b:#4338ca;
+  }
+  .dir-b .dir-head { border-color: var(--border); }
+  .dir-b.is-dark, .dir-b.dark-sample {
+    --canvas:#070b14; --surface:#131c31; --surface-2:#0b1120;
+    --border:#1e2740; --border-strong:#2c3852;
+    --text:#e2e7f0; --text-2:#9aa6be; --text-3:#7a88a6;
+    --ring:#818cf8; --selection:rgba(99,102,241,.38);
+  }
+  .dir-c {
+    --brand-50:#f4f5f4; --brand-100:#e7e9e8; --brand-200:#d2d6d4; --brand-300:#b3bab7;
+    --brand-400:#8d9692; --brand-500:#334155; --brand-600:#1e293b; --brand-700:#0f172a;
+    --brand-800:#0b1220; --brand-900:#080d18; --brand-950:#04070f;
+    --accent:#84cc16; --ok:#22c55e; --warn:#eab308; --danger:#ef4444;
+    --fill-a:#334155; --fill-b:#1e293b;
+  }
+  .dir-c .dir-head { border-color: var(--border); }
+  .dir-c.is-dark, .dir-c.dark-sample {
+    --canvas:#0b0c0b; --surface:#141615; --surface-2:#101211;
+    --border:#262b26; --border-strong:#333a33;
+    --text:#e9ede9; --text-2:#b6beb6; --text-3:#8b948b;
+    --ring:#a3e635; --selection:rgba(132,204,22,.32);
+  }
+
+  /* ===== 色卡 ===== */
+  .ramp { display: grid; grid-template-columns: repeat(11, 1fr); gap: 4px; margin-top: 12px; }
+  .ramp .sw { border-radius: 6px; height: 46px; position: relative; }
+  .ramp .sw b {
+    position: absolute; left: 5px; bottom: 4px; font-size: 9px; font-weight: 600;
+    color: rgba(255,255,255,.92); letter-spacing: .02em;
+  }
+  .ramp .sw.light b { color: rgba(15,23,42,.75); }
+  .ramp-labels { display: grid; grid-template-columns: repeat(11, 1fr); gap: 4px; margin-top: 4px; }
+  .ramp-labels span { font-size: 9px; color: var(--text-3); text-align: center; font-family: var(--font-mono); }
+
+  .sem-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(88px, 1fr)); gap: 8px; margin-top: 12px; }
+  .sem { border-radius: 10px; padding: 8px; border: 1px solid var(--border); }
+  .sem .chip { height: 26px; border-radius: 6px; margin-bottom: 6px; }
+  .sem .name { font-size: 11px; font-weight: 600; color: var(--text-2); }
+  .sem .val { font-size: 10px; font-family: var(--font-mono); color: var(--text-3); }
+
+  /* ===== 组件样例 ===== */
+  .demo { display: grid; gap: 18px; }
+  .demo-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  .demo-label { font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--text-3); }
+
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+    font-family: var(--font-sans); font-size: 13px; font-weight: 600;
+    border-radius: var(--radius-xl); padding: 9px 16px; border: 1px solid transparent;
+    cursor: pointer; transition: background .18s ease, box-shadow .18s ease, border-color .18s ease, transform .18s ease;
+    color: var(--text);
+  }
+  .btn:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--ring); }
+  .btn:active { transform: scale(.98); }
+  .btn-primary { background: linear-gradient(135deg, var(--fill-a), var(--fill-b)); color: #fff; box-shadow: 0 2px 10px rgba(79,70,229,.22); }
+  .btn-primary:hover { filter: brightness(1.06); box-shadow: 0 4px 18px rgba(79,70,229,.3); }
+  .btn-secondary { background: var(--surface); border-color: var(--border); color: var(--text); }
+  .btn-secondary:hover { border-color: var(--border-strong); }
+  .btn-ghost { background: transparent; color: var(--text-2); }
+  .btn-ghost:hover { background: var(--surface-2); }
+  .btn-danger { background: linear-gradient(135deg, #dc2626, #b91c1c); color: #fff; }
+  .btn-success { background: linear-gradient(135deg, #047857, #065f46); color: #fff; }
+  .btn-warning { background: linear-gradient(135deg, #fbbf24, #f59e0b); color: #0b1120; }
+
+  .input, .select {
+    font-family: var(--font-sans); font-size: 13px; color: var(--text);
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius-xl); padding: 9px 12px; width: 220px;
+    transition: border-color .18s ease, box-shadow .18s ease;
+  }
+  .input::placeholder { color: var(--text-3); }
+  .input:focus, .select:focus { outline: none; border-color: var(--brand-500); box-shadow: 0 0 0 3px var(--brand-500-halo); }
+  .input.err { border-color: #ef4444; }
+  .input.err:focus { box-shadow: 0 0 0 3px rgba(239,68,68,.25); }
+  .input:disabled { background: var(--surface-2); color: var(--text-3); cursor: not-allowed; }
+  .field { display: grid; gap: 5px; }
+  .field .lbl { font-size: 12px; font-weight: 600; color: var(--text-2); }
+  .field .hint { font-size: 11px; color: var(--text-3); }
+  .field .err-txt { font-size: 11px; color: #dc2626; }
+
+  .badges { display: flex; flex-wrap: wrap; gap: 8px; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
+    font-size: 11px; font-weight: 600; padding: 3px 9px; border-radius: 999px; border: 1px solid transparent;
+  }
+  .b-primary { background: var(--brand-50); color: var(--brand-700); border-color: var(--brand-200); }
+  .b-success { background: var(--ok-bg); color: var(--ok-fg); border-color: var(--ok-bd); }
+  .b-warning { background: var(--warn-bg); color: var(--warn-fg); border-color: var(--warn-bd); }
+  .b-danger  { background: var(--danger-bg); color: var(--danger-fg); border-color: var(--danger-bd); }
+  .b-gray    { background: var(--surface-2); color: var(--text-2); border-color: var(--border); }
+  .theme {
+    --ok-bg:#ecfdf5; --ok-fg:#047857; --ok-bd:#a7f3d0;
+    --warn-bg:#fffbeb; --warn-fg:#b45309; --warn-bd:#fde68a;
+    --danger-bg:#fef2f2; --danger-fg:#b91c1c; --danger-bd:#fecaca;
+    --brand-500-halo: rgba(99,102,241,.28);
+  }
+  .is-dark {
+    --ok-bg: rgba(16,185,129,.15); --ok-fg:#6ee7b7; --ok-bd: rgba(16,185,129,.35);
+    --warn-bg: rgba(245,158,11,.15); --warn-fg:#fcd34d; --warn-bd: rgba(245,158,11,.35);
+    --danger-bg: rgba(239,68,68,.15); --danger-fg:#fca5a5; --danger-bd: rgba(239,68,68,.35);
+    --brand-500-halo: rgba(129,140,248,.34);
+  }
+
+  .table-wrap { border: 1px solid var(--border); border-radius: var(--radius-xl); overflow: hidden; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--border); }
+  th { background: var(--surface-2); color: var(--text-2); font-weight: 600; font-size: 12px; }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr:hover { background: var(--surface-2); }
+  td.num { text-align: right; font-family: var(--font-mono); }
+  td .model { font-family: var(--font-mono); font-size: 12px; }
+
+  .card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+  .card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-2xl);
+    padding: 14px 16px; transition: transform .2s ease, box-shadow .2s ease, border-color .2s ease;
+  }
+  .card:hover { transform: translateY(-2px); box-shadow: 0 10px 40px rgba(7,11,20,.08); border-color: var(--border-strong); }
+  .card .k { font-size: 12px; color: var(--text-3); }
+  .card .v { font-size: 22px; font-weight: 700; letter-spacing: -.01em; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .card .delta { font-size: 11px; font-weight: 600; margin-top: 4px; }
+
+  .tabs { display: inline-flex; gap: 4px; padding: 4px; border-radius: var(--radius-xl); background: var(--surface-2); }
+  .tab { font-size: 12px; font-weight: 600; padding: 6px 12px; border-radius: var(--radius-lg); color: var(--text-3); cursor: pointer; }
+  .tab[aria-selected="true"] { background: var(--surface); color: var(--text); box-shadow: 0 1px 2px rgba(7,11,20,.08); }
+  .tab:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+
+  .switch { width: 44px; height: 24px; border-radius: 999px; background: var(--border-strong); position: relative; cursor: pointer; }
+  .switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 20px; height: 20px; border-radius: 999px; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.2); }
+  .switch.on { background: var(--brand-500); }
+  .switch.on::after { left: 22px; }
+
+  .code-block {
+    font-family: var(--font-mono); font-size: 12px; line-height: 1.7;
+    background: #0b1120; color: #e2e7f0; border-radius: var(--radius-xl); padding: 14px 16px;
+    overflow-x: auto; border: 1px solid #1e2740;
+  }
+  .code-block .cmt { color: #7a88a6; }
+  .code-block .key { color: #a5b4fc; }
+  .code-block .str { color: #67e8f9; }
+
+  .toast {
+    display: flex; gap: 10px; align-items: flex-start; background: var(--surface);
+    border: 1px solid var(--border); border-left: 4px solid var(--brand-500);
+    border-radius: var(--radius-xl); padding: 10px 14px; font-size: 12px; max-width: 420px;
+  }
+  .toast.ok { border-left-color: #10b981; }
+  .toast.err { border-left-color: #ef4444; }
+
+  .sel-demo { background: var(--selection); padding: 2px 6px; border-radius: 4px; }
+
+  /* ===== 数据表 ===== */
+  table.data { font-size: 12.5px; background: var(--surface); }
+  table.data code { font-size: 11.5px; }
+  .pass, .fail, .note {
+    display: inline-block; font-size: 11px; font-weight: 700; padding: 1px 7px; border-radius: 999px;
+    font-family: var(--font-mono);
+  }
+  .pass { background: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; }
+  .fail { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; }
+  .note { background: #eef2ff; color: #4338ca; border: 1px solid #c7d2fe; }
+
+  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 900px) { .split { grid-template-columns: 1fr; } }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 10px; font-size: 12px; color: #475569; }
+  .legend b { font-family: var(--font-mono); font-weight: 600; color: #0f172a; }
+
+  ul.rules { margin: 8px 0 0; padding-left: 20px; font-size: 13px; color: #334155; }
+  ul.rules li { margin: 4px 0; }
+  .kbd {
+    font-family: var(--font-mono); font-size: 11px; background: #f1f5f9; border: 1px solid #cbd5e1;
+    border-bottom-width: 2px; border-radius: 5px; padding: 1px 5px; color: #0f172a;
+  }
+  footer { margin-top: 48px; font-size: 12px; color: #64748b; }
+</style>
+</head>
+<body>
+
+<header class="page-head">
+  <div class="wrap">
+    <span class="kicker"><span class="dot"></span> sub2api · design tokens v1.0</span>
+    <h1>UI 配色三方向预览与对比度实测</h1>
+    <p class="lead">
+      依据 <code>openspec/changes/fork-tickets-pricing-ui/design.md</code> §4.1/§4.2 与 ui-ux-pro-max
+      <code>--design-system</code> 输出（AI API gateway developer platform SaaS dashboard，density 7 / variance 5 / motion 4）。
+      默认落地方向 <strong>B 靛青 Indigo &amp; Cyan</strong>；A/C 仅替换令牌即可切换。本页纯静态、零外部依赖（无字体 CDN、无脚本、无外链）。
+    </p>
+    <div class="meta">
+      <span>默认：B 靛青</span>
+      <span>primary 11 阶</span>
+      <span>ink 11 阶</span>
+      <span>正文/主按钮 ≥ 4.5:1</span>
+      <span>焦点环不透明 ≥ 3:1</span>
+      <span>系统字体栈</span>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <!-- ============ 1. 三方向 ============ -->
+  <section id="directions">
+    <div class="section-head">
+      <span class="idx">01</span>
+      <h2>三方向对比</h2>
+      <span class="muted">同一套类名与组件，仅令牌数值不同</span>
+    </div>
+    <div class="dir-grid">
+
+      <!-- A 玉青 -->
+      <article class="panel dir-card theme dir-a">
+        <div class="dir-head">
+          <div>
+            <h3>A · 玉青 Jade Circuit</h3>
+            <p class="tiny">延续现有青绿品牌</p>
+          </div>
+          <span class="tag">备选</span>
+        </div>
+        <div class="dir-body">
+          <div class="ramp">
+            <div class="sw light" style="background:var(--brand-50)"></div>
+            <div class="sw light" style="background:var(--brand-100)"></div>
+            <div class="sw light" style="background:var(--brand-200)"></div>
+            <div class="sw light" style="background:var(--brand-300)"></div>
+            <div class="sw" style="background:var(--brand-400)"><b>400</b></div>
+            <div class="sw" style="background:var(--brand-500)"><b>500</b></div>
+            <div class="sw" style="background:var(--brand-600)"><b>600</b></div>
+            <div class="sw" style="background:var(--brand-700)"><b>700</b></div>
+            <div class="sw" style="background:var(--brand-800)"><b>800</b></div>
+            <div class="sw" style="background:var(--brand-900)"><b>900</b></div>
+            <div class="sw" style="background:var(--brand-950)"><b>950</b></div>
+          </div>
+          <div class="ramp-labels">
+            <span>#EFFCF8</span><span>#D7F7EF</span><span>#B0EEE1</span><span>#7FE0CF</span><span>#46C9B5</span>
+            <span>#17A88A</span><span>#0C8A73</span><span>#0C6E5D</span><span>#0B5A4C</span><span>#0A4A3F</span><span>#052620</span>
+          </div>
+          <div class="sem-row">
+            <div class="sem"><div class="chip" style="background:#0284c7"></div><div class="name">强调</div><div class="val">#0284C7</div></div>
+            <div class="sem"><div class="chip" style="background:#059669"></div><div class="name">成功</div><div class="val">#059669</div></div>
+            <div class="sem"><div class="chip" style="background:#d97706"></div><div class="name">警告</div><div class="val">#D97706</div></div>
+            <div class="sem"><div class="chip" style="background:#dc2626"></div><div class="name">危险</div><div class="val">#DC2626</div></div>
+            <div class="sem"><div class="chip" style="background:#F7FAF9;border:1px solid #e2e8f0"></div><div class="name">亮底</div><div class="val">#F7FAF9</div></div>
+          </div>
+          <div class="demo-row" style="margin-top:14px">
+            <button class="btn btn-primary">主按钮（已压深档）</button>
+            <span class="badge b-gray">中性</span>
+          </div>
+          <p class="dir-note">
+            实测：原 <code>#0C8A73</code> 作实心填充/链接仅 <strong>4.29:1</strong>（不达 AA）→ 实心档下压到
+            <code>#0A7F6A</code>（4.93:1）、链接用 <code>#0C6E5D</code>（6.17:1）。暗色 <code>#5EEAD4</code> on
+            <code>#06110F</code> = 12.97:1 ✅。品牌延续最好，但需额外两档压深，双冷色在暗色下层次偏弱。
+          </p>
+        </div>
+      </article>
+
+      <!-- B 靛青（默认） -->
+      <article class="panel dir-card theme dir-b">
+        <div class="dir-head">
+          <div>
+            <h3>B · 靛青 Indigo &amp; Cyan</h3>
+            <p class="tiny">现代开发者 SaaS · 蓝紫信任感</p>
+          </div>
+          <span class="tag default">默认</span>
+        </div>
+        <div class="dir-body">
+          <div class="ramp">
+            <div class="sw light" style="background:var(--brand-50)"></div>
+            <div class="sw light" style="background:var(--brand-100)"></div>
+            <div class="sw light" style="background:var(--brand-200)"></div>
+            <div class="sw" style="background:var(--brand-300)"><b>300</b></div>
+            <div class="sw" style="background:var(--brand-400)"><b>400</b></div>
+            <div class="sw" style="background:var(--brand-500)"><b>500</b></div>
+            <div class="sw" style="background:var(--brand-600)"><b>600</b></div>
+            <div class="sw" style="background:var(--brand-700)"><b>700</b></div>
+            <div class="sw" style="background:var(--brand-800)"><b>800</b></div>
+            <div class="sw" style="background:var(--brand-900)"><b>900</b></div>
+            <div class="sw" style="background:var(--brand-950)"><b>950</b></div>
+          </div>
+          <div class="ramp-labels">
+            <span>#EEF2FF</span><span>#E0E7FF</span><span>#C7D2FE</span><span>#A5B4FC</span><span>#818CF8</span>
+            <span>#6366F1</span><span>#4F46E5</span><span>#4338CA</span><span>#3730A3</span><span>#312E81</span><span>#1E1B4B</span>
+          </div>
+          <div class="sem-row">
+            <div class="sem"><div class="chip" style="background:#06b6d4"></div><div class="name">强调</div><div class="val">#06B6D4</div></div>
+            <div class="sem"><div class="chip" style="background:#10b981"></div><div class="name">成功</div><div class="val">#10B981</div></div>
+            <div class="sem"><div class="chip" style="background:#f59e0b"></div><div class="name">警告</div><div class="val">#F59E0B</div></div>
+            <div class="sem"><div class="chip" style="background:#ef4444"></div><div class="name">危险</div><div class="val">#EF4444</div></div>
+            <div class="sem"><div class="chip" style="background:#F6F7FB;border:1px solid #e2e8f0"></div><div class="name">亮底</div><div class="val">#F6F7FB</div></div>
+          </div>
+          <div class="demo-row" style="margin-top:14px">
+            <button class="btn btn-primary">主按钮 600→700</button>
+            <button class="btn btn-secondary">次按钮</button>
+            <span class="badge b-primary">默认</span>
+            <span class="badge b-success">已解决</span>
+          </div>
+          <p class="dir-note">
+            实测：白字 on <code>primary-600</code> = <strong>6.29:1</strong>、on <code>primary-700</code> = <strong>7.90:1</strong> ✅；
+            链接 <code>primary-600</code> on 白 = 6.29:1 ✅；暗色 <code>primary-400</code> on <code>#070B14</code> = 6.60:1 ✅。
+            AA 全通过，冷色层次（靛青 + 青）差异明显，避免与常见青绿 SaaS 同质化。
+          </p>
+        </div>
+      </article>
+
+      <!-- C 石墨青柠 -->
+      <article class="panel dir-card theme dir-c">
+        <div class="dir-head">
+          <div>
+            <h3>C · 石墨青柠 Graphite &amp; Lime</h3>
+            <p class="tiny">终端 / 极客，差异化最强</p>
+          </div>
+          <span class="tag">备选</span>
+        </div>
+        <div class="dir-body">
+          <div class="ramp">
+            <div class="sw light" style="background:var(--brand-50)"></div>
+            <div class="sw light" style="background:var(--brand-100)"></div>
+            <div class="sw light" style="background:var(--brand-200)"></div>
+            <div class="sw light" style="background:var(--brand-300)"></div>
+            <div class="sw" style="background:var(--brand-400)"><b>400</b></div>
+            <div class="sw" style="background:var(--brand-500)"><b>500</b></div>
+            <div class="sw" style="background:var(--brand-600)"><b>600</b></div>
+            <div class="sw" style="background:var(--brand-700)"><b>700</b></div>
+            <div class="sw" style="background:var(--brand-800)"><b>800</b></div>
+            <div class="sw" style="background:var(--brand-900)"><b>900</b></div>
+            <div class="sw" style="background:var(--brand-950)"><b>950</b></div>
+          </div>
+          <div class="ramp-labels">
+            <span></span><span></span><span></span><span></span><span></span>
+            <span>#334155</span><span>#1E293B</span><span>#0F172A</span><span></span><span></span><span></span>
+          </div>
+          <div class="sem-row">
+            <div class="sem"><div class="chip" style="background:#84cc16"></div><div class="name">强调</div><div class="val">#84CC16</div></div>
+            <div class="sem"><div class="chip" style="background:#22c55e"></div><div class="name">成功</div><div class="val">#22C55E</div></div>
+            <div class="sem"><div class="chip" style="background:#eab308"></div><div class="name">警告</div><div class="val">#EAB308</div></div>
+            <div class="sem"><div class="chip" style="background:#ef4444"></div><div class="name">危险</div><div class="val">#EF4444</div></div>
+            <div class="sem"><div class="chip" style="background:#FAFAF9;border:1px solid #e2e8f0"></div><div class="name">亮底</div><div class="val">#FAFAF9</div></div>
+          </div>
+          <div class="demo-row" style="margin-top:14px">
+            <button class="btn btn-primary">主按钮</button>
+            <span class="badge b-gray">中性</span>
+          </div>
+          <p class="dir-note">
+            实测：白字 on <code>#334155</code> = <strong>10.35:1</strong>（最安全）；暗色 <code>#A3E635</code> on
+            <code>#0B0C0B</code> = 13.00:1 ✅。主色与灰阶过近，品牌识别弱；适合极客工具定位，不适合作为默认。
+          </p>
+        </div>
+      </article>
+    </div>
+  </section>
+
+  <!-- ============ 2. B 令牌全量 ============ -->
+  <section id="tokens">
+    <div class="section-head">
+      <span class="idx">02</span>
+      <h2>方向 B · 完整令牌</h2>
+      <span class="muted">primary 11 阶 / ink 11 阶 / 语义色 / 渐变 / 阴影 / 圆角 / 间距 / 字阶</span>
+    </div>
+
+    <div class="split">
+      <div class="panel theme dir-b">
+        <h3>primary（靛青 Indigo）</h3>
+        <p class="tiny">实心填充只用 600/700；正文用 600（亮）/400（暗）</p>
+        <div class="ramp">
+          <div class="sw light" style="background:var(--brand-50)"></div>
+          <div class="sw light" style="background:var(--brand-100)"></div>
+          <div class="sw light" style="background:var(--brand-200)"></div>
+          <div class="sw" style="background:var(--brand-300)"><b>300</b></div>
+          <div class="sw" style="background:var(--brand-400)"><b>400</b></div>
+          <div class="sw" style="background:var(--brand-500)"><b>500</b></div>
+          <div class="sw" style="background:var(--brand-600)"><b>600</b></div>
+          <div class="sw" style="background:var(--brand-700)"><b>700</b></div>
+          <div class="sw" style="background:var(--brand-800)"><b>800</b></div>
+          <div class="sw" style="background:var(--brand-900)"><b>900</b></div>
+          <div class="sw" style="background:var(--brand-950)"><b>950</b></div>
+        </div>
+        <div class="ramp-labels">
+          <span>50</span><span>100</span><span>200</span><span>300</span><span>400</span>
+          <span>500</span><span>600</span><span>700</span><span>800</span><span>900</span><span>950</span>
+        </div>
+        <p class="tiny" style="margin-top:10px">
+          #EEF2FF · #E0E7FF · #C7D2FE · #A5B4FC · #818CF8 · #6366F1 · #4F46E5 · #4338CA · #3730A3 · #312E81 · #1E1B4B
+        </p>
+      </div>
+
+      <div class="panel theme dir-b is-dark">
+        <h3 style="color:var(--text)">dark（ink 色阶：950 深 → 50 浅）</h3>
+        <p class="tiny">暗色不是反色：独立色阶、独立测量对比度</p>
+        <div class="ramp">
+          <div class="sw" style="background:#070B14"><b>950</b></div>
+          <div class="sw" style="background:#0B1120"><b>900</b></div>
+          <div class="sw" style="background:#131C31"><b>800</b></div>
+          <div class="sw" style="background:#1E2740"><b>700</b></div>
+          <div class="sw" style="background:#2C3852"><b>600</b></div>
+          <div class="sw" style="background:#475573"><b>500</b></div>
+          <div class="sw" style="background:#6E7C9A"><b>400×</b></div>
+          <div class="sw" style="background:#7A88A6"><b>400</b></div>
+          <div class="sw" style="background:#9AA6BE"><b>300</b></div>
+          <div class="sw" style="background:#C3CCDC"><b>200</b></div>
+          <div class="sw light" style="background:#F5F7FB"><b>50</b></div>
+        </div>
+        <div class="ramp-labels">
+          <span>#070B14</span><span>#0B1120</span><span>#131C31</span><span>#1E2740</span><span>#2C3852</span>
+          <span>#475573</span><span>#6E7C9A</span><span>#7A88A6</span><span>#9AA6BE</span><span>#C3CCDC</span><span>#F5F7FB</span>
+        </div>
+        <p class="tiny" style="margin-top:10px;color:#7A88A6">
+          400 由 #6E7C9A（4.05:1 @ dark-800，不达 AA）提亮为 <strong style="color:#9AA6BE">#7A88A6</strong>（4.77:1）。
+          500 #475573 仅作装饰（2.64:1）。
+        </p>
+      </div>
+    </div>
+
+    <div class="split" style="margin-top:16px">
+      <div class="panel theme dir-b">
+        <h3>语义色（亮）</h3>
+        <div class="sem-row">
+          <div class="sem"><div class="chip" style="background:#10b981"></div><div class="name">success 500</div><div class="val">#10B981</div></div>
+          <div class="sem"><div class="chip" style="background:#047857"></div><div class="name">success 700</div><div class="val">#047857</div></div>
+          <div class="sem"><div class="chip" style="background:#f59e0b"></div><div class="name">warning 500</div><div class="val">#F59E0B</div></div>
+          <div class="sem"><div class="chip" style="background:#b45309"></div><div class="name">warning 700</div><div class="val">#B45309</div></div>
+          <div class="sem"><div class="chip" style="background:#ef4444"></div><div class="name">danger 500</div><div class="val">#EF4444</div></div>
+          <div class="sem"><div class="chip" style="background:#dc2626"></div><div class="name">danger 600</div><div class="val">#DC2626</div></div>
+          <div class="sem"><div class="chip" style="background:#06b6d4"></div><div class="name">info 500</div><div class="val">#06B6D4</div></div>
+          <div class="sem"><div class="chip" style="background:#0e7490"></div><div class="name">info 700</div><div class="val">#0E7490</div></div>
+        </div>
+        <p class="tiny" style="margin-top:10px">
+          文字用 700 档（≥4.5:1）；实心按钮：success 700→800、danger 600→700、warning 400→500 + 深字。
+          <code>cyan-600</code> 仅图形（白底 3.68:1）。
+        </p>
+      </div>
+
+      <div class="panel theme dir-b">
+        <h3>渐变 / 阴影 / 圆角</h3>
+        <div style="display:grid;gap:8px;margin-top:10px">
+          <div style="height:34px;border-radius:10px;background:linear-gradient(135deg,#6366F1 0%,#06B6D4 100%)"></div>
+          <div class="tiny">gradient-primary · #6366F1 → #06B6D4（装饰；不承载白字）</div>
+          <div style="height:34px;border-radius:10px;background:linear-gradient(135deg,#131C31 0%,#070B14 100%)"></div>
+          <div class="tiny">gradient-dark · #131C31 → #070B14</div>
+          <div style="height:34px;border-radius:10px;background:
+            radial-gradient(at 40% 20%, rgba(99,102,241,.14) 0px, transparent 50%),
+            radial-gradient(at 80% 0%, rgba(6,182,212,.10) 0px, transparent 50%),
+            radial-gradient(at 0% 50%, rgba(99,102,241,.10) 0px, transparent 50%), #F6F7FB"></div>
+          <div class="tiny">mesh-gradient · 靛青/青 双光斑（低透明度）</div>
+        </div>
+        <div style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap;align-items:center">
+          <span class="tiny">shadow-card</span>
+          <div style="width:56px;height:30px;border-radius:10px;background:#fff;border:1px solid #e2e8f0;box-shadow:0 1px 3px rgba(7,11,20,.04),0 1px 2px rgba(7,11,20,.06)"></div>
+          <span class="tiny">shadow-card-hover</span>
+          <div style="width:56px;height:30px;border-radius:10px;background:#fff;border:1px solid #e2e8f0;box-shadow:0 10px 40px rgba(7,11,20,.08)"></div>
+          <span class="tiny">glow</span>
+          <div style="width:56px;height:30px;border-radius:10px;background:#4f46e5;box-shadow:0 0 20px rgba(99,102,241,.28)"></div>
+        </div>
+        <div style="display:flex;gap:6px;margin-top:14px;align-items:flex-end;flex-wrap:wrap">
+          <div style="width:44px;height:28px;background:#eef2ff;border:1px solid #c7d2fe;border-radius:6px;font-size:10px;text-align:center;line-height:28px">6</div>
+          <div style="width:44px;height:28px;background:#eef2ff;border:1px solid #c7d2fe;border-radius:8px;font-size:10px;text-align:center;line-height:28px">8</div>
+          <div style="width:44px;height:28px;background:#eef2ff;border:1px solid #c7d2fe;border-radius:12px;font-size:10px;text-align:center;line-height:28px">12</div>
+          <div style="width:44px;height:28px;background:#eef2ff;border:1px solid #c7d2fe;border-radius:16px;font-size:10px;text-align:center;line-height:28px">16</div>
+          <div style="width:44px;height:28px;background:#eef2ff;border:1px solid #c7d2fe;border-radius:24px;font-size:10px;text-align:center;line-height:28px">24</div>
+          <div style="width:44px;height:28px;background:#eef2ff;border:1px solid #c7d2fe;border-radius:32px;font-size:10px;text-align:center;line-height:28px">32</div>
+        </div>
+        <p class="tiny" style="margin-top:8px">圆角：md 6 · lg 8 · xl 12（默认控件）· 2xl 16（卡片/弹窗）· 3xl 24 · 4xl 32 · full</p>
+      </div>
+    </div>
+
+    <div class="panel theme dir-b" style="margin-top:16px">
+      <h3>字阶与间距（系统字体栈，等宽数字）</h3>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-top:12px">
+        <div><div style="font-size:36px;font-weight:750;line-height:1.15">36 / 40</div><div class="tiny">Hero 标题 · 700–800</div></div>
+        <div><div style="font-size:24px;font-weight:700;line-height:1.33">24 / 32</div><div class="tiny">页面标题 / 统计值 · 700</div></div>
+        <div><div style="font-size:18px;font-weight:600;line-height:1.55">18 / 28</div><div class="tiny">卡片标题 · 600</div></div>
+        <div><div style="font-size:16px;font-weight:400;line-height:1.5">16 / 24</div><div class="tiny">正文 · 400</div></div>
+        <div><div style="font-size:14px;font-weight:400;line-height:1.42">14 / 20</div><div class="tiny">界面正文 / 表格 · 400–500</div></div>
+        <div><div style="font-size:12px;font-weight:500;line-height:1.33">12 / 16</div><div class="tiny">徽章 / 辅助 · 500</div></div>
+      </div>
+      <div style="display:flex;gap:6px;margin-top:16px;align-items:center;flex-wrap:wrap">
+        <span class="tiny" style="margin-right:6px">间距梯度</span>
+        <div style="height:12px;width:4px;background:#c7d2fe"></div>
+        <div style="height:12px;width:8px;background:#c7d2fe"></div>
+        <div style="height:12px;width:12px;background:#c7d2fe"></div>
+        <div style="height:12px;width:16px;background:#c7d2fe"></div>
+        <div style="height:12px;width:20px;background:#c7d2fe"></div>
+        <div style="height:12px;width:24px;background:#c7d2fe"></div>
+        <div style="height:12px;width:32px;background:#c7d2fe"></div>
+        <div style="height:12px;width:40px;background:#c7d2fe"></div>
+        <div style="height:12px;width:64px;background:#c7d2fe"></div>
+        <span class="tiny">4 · 6 · 8 · 12 · 16 · 20 · 24 · 32 · 40 · 64（4/8 基数，density 7）</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 3. 亮色组件样例 ============ -->
+  <section id="light">
+    <div class="section-head">
+      <span class="idx">03</span>
+      <h2>亮色组件样例（方向 B）</h2>
+      <span class="muted">按钮 / 输入 / 徽章 / 卡片 / 表格 / tabs / 提示</span>
+    </div>
+
+    <div class="panel theme dir-b">
+      <div class="demo">
+        <div>
+          <div class="demo-label">按钮（键盘 <span class="kbd">Tab</span> 可见焦点环）</div>
+          <div class="demo-row" style="margin-top:8px">
+            <button class="btn btn-primary">主按钮</button>
+            <button class="btn btn-secondary">次按钮</button>
+            <button class="btn btn-ghost">幽灵按钮</button>
+            <button class="btn btn-danger">删除</button>
+            <button class="btn btn-success">通过</button>
+            <button class="btn btn-warning">注意</button>
+            <button class="btn btn-primary" disabled style="opacity:.5;cursor:not-allowed">禁用</button>
+          </div>
+          <p class="tiny" style="margin-top:6px">
+            白字实测：primary-600 <b>6.29:1</b> · primary-700 <b>7.90:1</b> · red-600 <b>4.83:1</b> · emerald-700 <b>5.48:1</b> · 深字 on amber-500 <b>8.77:1</b>
+          </p>
+        </div>
+
+        <div>
+          <div class="demo-label">输入框</div>
+          <div class="demo-row" style="margin-top:8px;align-items:flex-start">
+            <div class="field">
+              <label class="lbl">模型名称</label>
+              <input class="input" placeholder="例如 kimi-k2" />
+              <span class="hint">输入后按 Enter 搜索</span>
+            </div>
+            <div class="field">
+              <label class="lbl">聚焦态</label>
+              <input class="input" value="deepseek-v4-pro" style="border-color:#6366f1;box-shadow:0 0 0 3px rgba(99,102,241,.28)" />
+              <span class="hint">边框 primary-500 + 3px 光晕</span>
+            </div>
+            <div class="field">
+              <label class="lbl">错误态</label>
+              <input class="input err" value="-1" />
+              <span class="err-txt">价格必须 ≥ 0</span>
+            </div>
+            <div class="field">
+              <label class="lbl">禁用</label>
+              <input class="input" value="未配置 override_file" disabled />
+              <span class="hint">只读</span>
+            </div>
+            <div class="field">
+              <label class="lbl">口径</label>
+              <select class="select">
+                <option>直接使用 1:1（direct）</option>
+                <option>按汇率折算（convert）</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <div class="demo-label">徽章（状态必须带文字，不单靠颜色）</div>
+          <div class="badges" style="margin-top:8px">
+            <span class="badge b-primary">open</span>
+            <span class="badge b-warning">pending</span>
+            <span class="badge b-success">resolved</span>
+            <span class="badge b-gray">closed</span>
+            <span class="badge b-danger">urgent</span>
+            <span class="badge b-gray">normal</span>
+            <span class="badge b-primary">已覆盖</span>
+          </div>
+        </div>
+
+        <div>
+          <div class="demo-label">统计卡片</div>
+          <div class="card-grid" style="margin-top:8px">
+            <div class="card">
+              <div class="k">本月调用量</div>
+              <div class="v">1,284,502</div>
+              <div class="delta" style="color:#047857">▲ 12.4% 环比</div>
+            </div>
+            <div class="card">
+              <div class="k">本月费用（USD）</div>
+              <div class="v">$38.4021</div>
+              <div class="delta" style="color:#b45309">▲ 3.1% 环比</div>
+            </div>
+            <div class="card">
+              <div class="k">待处理工单</div>
+              <div class="v">7</div>
+              <div class="delta" style="color:#475569">其中 2 条为 urgent</div>
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <div class="demo-label">表格（等宽数字 + hover 行）</div>
+          <div class="table-wrap" style="margin-top:8px">
+            <table>
+              <thead>
+                <tr><th>模型</th><th>供应商</th><th style="text-align:right">输入 / 1M</th><th style="text-align:right">输出 / 1M</th><th style="text-align:right">人民币等值</th><th>状态</th></tr>
+              </thead>
+              <tbody>
+                <tr><td><span class="model">kimi-k2</span></td><td>moonshot</td><td class="num">$0.5602</td><td class="num">$2.2400</td><td class="num">¥4.00</td><td><span class="badge b-primary">已覆盖</span></td></tr>
+                <tr><td><span class="model">deepseek-v4-pro</span></td><td>deepseek</td><td class="num">$0.2800</td><td class="num">$1.1200</td><td class="num">¥2.00</td><td><span class="badge b-gray">内置</span></td></tr>
+                <tr><td><span class="model">gpt-5.4</span></td><td>openai</td><td class="num">$1.2500</td><td class="num">$10.0000</td><td class="num">¥8.93</td><td><span class="badge b-gray">内置</span></td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="tiny" style="margin-top:6px">表格默认 <code>font-variant-numeric: tabular-nums</code>，价格列右对齐 + mono</p>
+        </div>
+
+        <div>
+          <div class="demo-label">Tabs / 开关 / 提示</div>
+          <div class="demo-row" style="margin-top:8px">
+            <div class="tabs" role="tablist">
+              <button class="tab" role="tab" aria-selected="true">内置价格</button>
+              <button class="tab" role="tab" aria-selected="false">人民币口径</button>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px">
+              <div class="switch on" role="switch" aria-checked="true" tabindex="0"></div><span class="tiny">邮件通知</span>
+              <div class="switch" role="switch" aria-checked="false" tabindex="0"></div><span class="tiny">关闭</span>
+            </div>
+            <div class="toast"><span class="badge b-success">成功</span><div>已保存 <b>kimi-k2</b> 的输入价（$0.5602 / 1M），热重载生效。</div></div>
+            <div class="toast err"><span class="badge b-danger">失败</span><div>写入失败：override_file 未配置路径。</div></div>
+          </div>
+        </div>
+
+        <div>
+          <div class="demo-label">代码块与选中文本</div>
+          <div class="code-block" style="margin-top:8px"><span class="cmt"># 统一 OpenAI 兼容协议</span>
+curl https://api.example.com/v1/chat/completions \
+  -H <span class="str">"Authorization: Bearer $SUB2API_KEY"</span> \
+  -d <span class="str">'{"model":"kimi-k2","messages":[{"role":"user","content":"hi"}]}'</span></div>
+          <p class="tiny" style="margin-top:8px">
+            选中文本样式：<span class="sel-demo">这一段文字模拟 ::selection（primary-500/22% 底 + primary-900 字，实测 7.82:1）</span>
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 4. 暗色组件样例 ============ -->
+  <section id="dark">
+    <div class="section-head">
+      <span class="idx">04</span>
+      <h2>暗色组件样例（同一套类名，加 .dark 作用域）</h2>
+      <span class="muted">暗色独立测量：正文 15.86:1 · 次正文 6.92:1 · 主色 6.60:1</span>
+    </div>
+
+    <div class="panel theme dir-b is-dark">
+      <div class="demo">
+        <div>
+          <div class="demo-label" style="color:var(--text-3)">按钮</div>
+          <div class="demo-row" style="margin-top:8px">
+            <button class="btn btn-primary">主按钮</button>
+            <button class="btn btn-secondary">次按钮</button>
+            <button class="btn btn-ghost">幽灵按钮</button>
+            <button class="btn btn-danger">删除</button>
+            <button class="btn btn-success">通过</button>
+            <button class="btn btn-warning">注意</button>
+          </div>
+          <p class="tiny" style="margin-top:6px;color:var(--text-3)">暗色下主按钮不变（白字 6.29:1），次按钮面 dark-800 + 边 dark-600 + 字 dark-200（10.49:1）</p>
+        </div>
+
+        <div>
+          <div class="demo-label" style="color:var(--text-3)">输入 / 徽章</div>
+          <div class="demo-row" style="margin-top:8px;align-items:flex-start">
+            <div class="field">
+              <label class="lbl" style="color:var(--text-2)">模型名称</label>
+              <input class="input" placeholder="例如 kimi-k2" />
+              <span class="hint" style="color:var(--text-3)">dark-400 占位（5.53:1）</span>
+            </div>
+            <div class="field">
+              <label class="lbl" style="color:var(--text-2)">聚焦态</label>
+              <input class="input" value="deepseek-v4-pro" style="border-color:#818cf8;box-shadow:0 0 0 3px rgba(129,140,248,.34)" />
+              <span class="hint" style="color:var(--text-3)">边框 primary-400（6.60:1）</span>
+            </div>
+            <div class="field">
+              <label class="lbl" style="color:var(--text-2)">错误态</label>
+              <input class="input err" value="-1" />
+              <span class="err-txt" style="color:#fca5a5">价格必须 ≥ 0</span>
+            </div>
+            <div class="badges" style="align-self:center">
+              <span class="badge b-primary">open</span>
+              <span class="badge b-warning">pending</span>
+              <span class="badge b-success">resolved</span>
+              <span class="badge b-gray">closed</span>
+              <span class="badge b-danger">urgent</span>
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <div class="demo-label" style="color:var(--text-3)">卡片与表格</div>
+          <div class="card-grid" style="margin-top:8px">
+            <div class="card">
+              <div class="k" style="color:var(--text-3)">本月调用量</div>
+              <div class="v" style="color:var(--text)">1,284,502</div>
+              <div class="delta" style="color:#6ee7b7">▲ 12.4% 环比</div>
+            </div>
+            <div class="card">
+              <div class="k" style="color:var(--text-3)">本月费用（USD）</div>
+              <div class="v" style="color:var(--text)">$38.4021</div>
+              <div class="delta" style="color:#fcd34d">▲ 3.1% 环比</div>
+            </div>
+            <div class="card">
+              <div class="k" style="color:var(--text-3)">待处理工单</div>
+              <div class="v" style="color:var(--text)">7</div>
+              <div class="delta" style="color:var(--text-2)">其中 2 条为 urgent</div>
+            </div>
+          </div>
+          <div class="table-wrap" style="margin-top:12px">
+            <table>
+              <thead>
+                <tr><th>模型</th><th>供应商</th><th style="text-align:right">输入 / 1M</th><th style="text-align:right">输出 / 1M</th><th>状态</th></tr>
+              </thead>
+              <tbody>
+                <tr><td><span class="model">kimi-k2</span></td><td>moonshot</td><td class="num">$0.5602</td><td class="num">$2.2400</td><td><span class="badge b-primary">已覆盖</span></td></tr>
+                <tr><td><span class="model">deepseek-v4-pro</span></td><td>deepseek</td><td class="num">$0.2800</td><td class="num">$1.1200</td><td><span class="badge b-gray">内置</span></td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div>
+          <div class="demo-label" style="color:var(--text-3)">Tabs / 提示 / 代码</div>
+          <div class="demo-row" style="margin-top:8px">
+            <div class="tabs" role="tablist">
+              <button class="tab" role="tab" aria-selected="true" style="background:var(--surface);color:var(--text)">内置价格</button>
+              <button class="tab" role="tab" aria-selected="false">人民币口径</button>
+            </div>
+            <div class="toast"><span class="badge b-success">成功</span><div style="color:var(--text-2)">已保存 <b style="color:var(--text)">kimi-k2</b> 的输入价，热重载生效。</div></div>
+          </div>
+          <div class="code-block" style="margin-top:10px"><span class="cmt"># 暗色代码块使用 ink-900 底 + ink-100 字（15.81:1）</span>
+curl https://api.example.com/v1/chat/completions \
+  -H <span class="str">"Authorization: Bearer $SUB2API_KEY"</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 5. 对比度表 ============ -->
+  <section id="contrast">
+    <div class="section-head">
+      <span class="idx">05</span>
+      <h2>对比度实测</h2>
+      <span class="muted">WCAG 2.1 相对亮度；正文/按钮 AA ≥ 4.5:1，大字与焦点环 ≥ 3:1</span>
+    </div>
+
+    <div class="split">
+      <div class="panel theme dir-b" style="padding:0">
+        <h3 style="padding:16px 18px 0">亮色</h3>
+        <div class="table-wrap" style="border:0;border-radius:0;margin-top:10px">
+          <table class="data">
+            <thead><tr><th>配对</th><th style="text-align:right">比值</th><th>判定</th></tr></thead>
+            <tbody>
+              <tr><td>正文 accent-900 on canvas</td><td class="num">16.68</td><td><span class="pass">AA</span></td></tr>
+              <tr><td>正文 accent-900 on card</td><td class="num">17.85</td><td><span class="pass">AA</span></td></tr>
+              <tr><td>次正文 accent-600 on card</td><td class="num">7.56</td><td><span class="pass">AA</span></td></tr>
+              <tr><td>次正文 accent-600 on canvas</td><td class="num">7.06</td><td><span class="pass">AA</span></td></tr>
+              <tr><td>accent-500 on canvas</td><td class="num">4.45</td><td><span class="fail">不达</span></td></tr>
+              <tr><td>链接 primary-600 on white</td><td class="num">6.29</td><td><span class="pass">AA</span></td></tr>
+              <tr><td>链接 primary-600 on canvas</td><td class="num">5.87</td><td><span class="pass">AA</span></td></tr>
+              <tr><td>primary-500 作正文 on canvas</td><td class="num">4.17</td><td><span class="fail">不达</span></td></tr>
+              <tr><td>主按钮白字 on primary-500</td><td class="num">4.47</td><td><span class="fail">不达</span></td></tr>
+              <tr><td>主按钮白字 on primary-600</td><td class="num">6.29</td><td><span class="pass">AA</span></td></tr>
+              <tr><td>主按钮白字 on primary-700</td><td class="num">7.90</td><td><span class="pass">AA</span></td></tr>
+              <tr><td>徽章 primary-700 on primary-50</td><td class="num">7.07</td><td><span class="pass">AA</span></td></tr>
+              <tr><td>危险按钮白字 on red-600</td><td class="num">4.83</td><td><span class="pass">AA</span></td></tr>
+              <tr><td>危险按钮白字 on red-500（旧）</td><td class="num">3.76</td><td><span class="fail">不达</span></td></tr>
+              <tr><td>成功按钮白字 on emerald-700</td><td class="num">5.48</td><td><span class="pass">AA</span></td></tr>
+              <tr><td>成功按钮白字 on emerald-500（旧）</td><td class="num">2.54</td><td><span class="fail">不达</span></td></tr>
+              <tr><td>警告按钮 dark-900 on amber-400</td><td class="num">11.28</td><td><span class="pass">AA</span></td></tr>
+              <tr><td>警告按钮白字 on amber-500（旧）</td><td class="num">2.15</td><td><span class="fail">不达</span></td></tr>
+              <tr><td>焦点环 primary-500 on white</td><td class="num">4.47</td><td><span class="pass">≥3</span></td></tr>
+              <tr><td>焦点环 primary-500/60（旧）</td><td class="num">2.31</td><td><span class="fail">不达</span></td></tr>
+              <tr><td>选中文本 primary-900 on selection</td><td class="num">7.82</td><td><span class="pass">AA</span></td></tr>
+              <tr><td>canvas vs card（表面差）</td><td class="num">1.07</td><td><span class="note">靠边框</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel theme dir-b is-dark" style="padding:0">
+        <h3 style="padding:16px 18px 0;color:var(--text)">暗色</h3>
+        <div class="table-wrap" style="border:0;border-radius:0;margin-top:10px">
+          <table class="data">
+            <thead><tr><th>配对</th><th style="text-align:right">比值</th><th>判定</th></tr></thead>
+            <tbody>
+              <tr><td>正文 dark-100 on dark-950</td><td class="num">15.86</td><td><span class="pass">AA</span></td></tr>
+              <tr><td>正文 dark-100 on dark-800</td><td class="num">13.67</td><td><span class="pass">AA</span></td></tr>
+              <tr><td>次正文 dark-300 on dark-950</td><td class="num">8.03</td><td><span class="pass">AA</span></td></tr>
+              <tr><td>次正文 dark-300 on dark-800</td><td class="num">6.92</td><td><span class="pass">AA</span></td></tr>
+              <tr><td>三级 dark-400 on dark-950</td><td class="num">5.53</td><td><span class="pass">AA</span></td></tr>
+              <tr><td>三级 dark-400 on dark-800</td><td class="num">4.77</td><td><span class="pass">AA</span></td></tr>
+              <tr><td>dark-400 on dark-700</td><td class="num">4.16</td><td><span class="fail">不达</span></td></tr>
+              <tr><td>dark-500 作正文 on dark-950</td><td class="num">2.64</td><td><span class="fail">不达</span></td></tr>
+              <tr><td>主色 primary-400 on dark-950</td><td class="num">6.60</td><td><span class="pass">AA</span></td></tr>
+              <tr><td>主色 primary-400 on dark-800</td><td class="num">5.69</td><td><span class="pass">AA</span></td></tr>
+              <tr><td>primary-300 on dark-950</td><td class="num">9.87</td><td><span class="pass">AA</span></td></tr>
+              <tr><td>徽章 primary-300 on primary-900/15</td><td class="num">8.81</td><td><span class="pass">AA</span></td></tr>
+              <tr><td>主按钮白字 on primary-600</td><td class="num">6.29</td><td><span class="pass">AA</span></td></tr>
+              <tr><td>焦点环 primary-400 on dark-950</td><td class="num">6.60</td><td><span class="pass">≥3</span></td></tr>
+              <tr><td>选中文本 primary-100 on selection</td><td class="num">11.49</td><td><span class="pass">AA</span></td></tr>
+              <tr><td>卡片 dark-800 vs canvas（表面差）</td><td class="num">1.35</td><td><span class="note">靠边框</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top:16px">
+      <h3>三方向主按钮横向</h3>
+      <div class="legend">
+        <span>A <b>#0C8A73</b> → 白字 4.29:1 <span class="fail">不达</span>（压深 #0A7F6A → 4.93:1）</span>
+        <span>B <b>#4F46E5→#4338CA</b> → 6.29 / 7.90:1 <span class="pass">AA</span></span>
+        <span>C <b>#334155</b> → 10.35:1 <span class="pass">AA</span></span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 6. 禁用项 ============ -->
+  <section id="rules">
+    <div class="section-head">
+      <span class="idx">06</span>
+      <h2>禁用项与迁移要点</h2>
+    </div>
+    <div class="split">
+      <div class="panel">
+        <h3>禁用（Do Not）</h3>
+        <ul class="rules">
+          <li>禁止外部字体 CDN（Google Fonts / Adobe Fonts）；中文字体走系统栈</li>
+          <li>禁止 emoji 当图标，状态必须带文字或 SVG</li>
+          <li>禁止组件内裸 hex / rgb，只用令牌类</li>
+          <li>禁止把暗色做成亮色反色（用 ink 独立色阶，分开测对比度）</li>
+          <li>禁止移除焦点环；禁止用 <code>/60</code> 低透明度环（2.31:1）</li>
+          <li>禁止 <code>primary-500</code> 实心 + 白字（4.47:1）；实心用 600/700</li>
+          <li>禁止用颜色单独表达状态（成功/警告/工单状态）</li>
+          <li>禁止 <code>dark-700</code> 面 + <code>dark-400</code> 正文（4.16:1）</li>
+          <li>禁止改名/删除既有 <code>animation</code>/<code>keyframes</code></li>
+          <li>禁止用 <code>!important</code> 或行内样式绕开令牌</li>
+        </ul>
+      </div>
+      <div class="panel">
+        <h3>迁移速查</h3>
+        <ul class="rules">
+          <li><code>text-gray-*</code> / <code>bg-gray-*</code> → <code>accent-*</code>（页面底由 body 提供）</li>
+          <li><code>dark:text-white</code> → <code>dark:text-dark-50</code></li>
+          <li><code>dark:text-dark-500</code> 正文 → <code>dark-400</code>（≥4.77:1）或 <code>dark-300</code></li>
+          <li><code>text-primary-500</code> 链接 → <code>primary-600</code>（亮）/ <code>primary-400</code>（暗）</li>
+          <li><code>focus:ring-*</code> → <code>focus-visible:ring-2 ring-primary-500</code>（暗 <code>primary-400</code>）</li>
+          <li>实心语义按钮：red-600/700、emerald-700/800、warning 深字浅底</li>
+          <li>价格/用量列加 <code>tabular-nums</code>（表格已默认）</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    sub2api fork · 设计令牌 v1.0（2026-11-14）· 权威文档 <code>design-system/sub2api/MASTER.md</code> ·
+    令牌实现 <code>frontend/tailwind.config.js</code> + <code>frontend/src/style.css</code> ·
+    本页为纯静态预览，无外部依赖。
+  </footer>
+</main>
+
+</body>
+</html>

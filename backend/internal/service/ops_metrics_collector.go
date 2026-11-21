@@ -16,10 +16,12 @@ import (
 	"unicode/utf8"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"github.com/shirou/gopsutil/v4/cpu"
 	"github.com/shirou/gopsutil/v4/mem"
+	"go.uber.org/zap"
 )
 
 const (
@@ -190,6 +192,7 @@ func (c *OpsMetricsCollector) collectOnce() {
 
 	startedAt := time.Now().UTC()
 	err := c.collectAndPersist(ctx)
+	c.logFailoverMetrics(ctx)
 	finishedAt := time.Now().UTC()
 
 	durationMs := finishedAt.Sub(startedAt).Milliseconds()
@@ -550,7 +553,8 @@ SELECT
   COALESCE(COUNT(*) FILTER (WHERE error_owner = 'provider' AND NOT is_business_limited AND COALESCE(upstream_status_code, status_code, 0) = 529), 0) AS upstream_529
 FROM ops_error_logs
 WHERE created_at >= $1 AND created_at < $2
-  AND is_count_tokens = FALSE`
+  AND is_count_tokens = FALSE
+  AND error_phase <> '` + OpsFailoverTelemetryPhase + `'`
 
 	if err := c.db.QueryRowContext(ctx, q, start, end).Scan(
 		&errorTotal,
@@ -565,6 +569,9 @@ WHERE created_at >= $1 AND created_at < $2
 	return errorTotal, businessLimited, errorSLA, upstreamExcl429529, upstream429, upstream529, nil
 }
 
+// queryAccountSwitchCount backs the existing account_switch_count field. Its
+// historical series counts eligible error events, independent of the final decision.
+// Keep the old kinds so new attempt and decision events do not change it.
 func (c *OpsMetricsCollector) queryAccountSwitchCount(ctx context.Context, start, end time.Time) (int64, error) {
 	q := `
 SELECT
@@ -584,6 +591,69 @@ WHERE o.created_at >= $1 AND o.created_at < $2
 		return 0, err
 	}
 	return count, nil
+}
+
+const (
+	OpsFailoverSwitchRatioMetric    = "failover_switch_ratio"
+	OpsFailoverExhaustedRatioMetric = "failover_exhausted_ratio"
+
+	// These events are written at a confirmed change of account and at terminal
+	// exhaustion, respectively. Eligibility, attempts and stops are separate.
+	OpsFailoverSwitchEvent    = "failover_switch"
+	OpsFailoverExhaustedEvent = "failover_exhausted"
+	// OpsFailoverTelemetryPhase identifies non-error rows used only by failover alerts.
+	OpsFailoverTelemetryPhase = "failover_telemetry"
+)
+
+// OpsFailoverRequestCounts counts affected requests once per event kind.
+// A request can be present in both counts.
+type OpsFailoverRequestCounts struct {
+	Switched  int64
+	Exhausted int64
+}
+
+// QueryFailoverRequestCounts reads explicit decisions written to upstream_errors.
+// Recovered failures are stored as 2xx ops rows, so the query intentionally has
+// no client status filter. Multiple events or rows for one request count once.
+func (c *OpsMetricsCollector) QueryFailoverRequestCounts(ctx context.Context, filter *OpsDashboardFilter) (OpsFailoverRequestCounts, error) {
+	if c == nil || c.db == nil || filter == nil {
+		return OpsFailoverRequestCounts{}, errors.New("failover metrics data source unavailable")
+	}
+	if !filter.StartTime.Before(filter.EndTime) || filter.EndTime.Sub(filter.StartTime) > 24*time.Hour {
+		return OpsFailoverRequestCounts{}, errors.New("invalid failover metrics window")
+	}
+	const query = `
+WITH flags AS (
+  SELECT CASE WHEN NULLIF(ev->>'execution_id', '') IS NOT NULL THEN 'execution:' || (ev->>'execution_id')
+              WHEN NULLIF(BTRIM(o.request_id), '') IS NOT NULL THEN 'legacy:' || BTRIM(o.request_id) END AS request_id,
+         ev->>'kind' = $5::text AS switched,
+         ev->>'kind' = $6::text AS exhausted,
+         o.id AS row_id
+  FROM ops_error_logs o
+  CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(o.upstream_errors) = 'array'
+       THEN o.upstream_errors ELSE '[]'::jsonb END) AS ev
+  WHERE created_at >= $1 AND created_at < $2
+    AND ($3 = '' OR platform = $3)
+    AND ($4::bigint IS NULL OR group_id = $4)
+    AND is_count_tokens = FALSE
+    AND ev->>'kind' IN ($5::text, $6::text)
+)
+SELECT COUNT(DISTINCT request_id) FILTER (WHERE switched)
+         + COUNT(DISTINCT row_id) FILTER (WHERE switched AND request_id IS NULL),
+       COUNT(DISTINCT request_id) FILTER (WHERE exhausted)
+         + COUNT(DISTINCT row_id) FILTER (WHERE exhausted AND request_id IS NULL)
+FROM flags`
+	platform := strings.ToLower(strings.TrimSpace(filter.Platform))
+	groupID := filter.GroupID
+	if groupID != nil && *groupID <= 0 {
+		groupID = nil
+	}
+	var counts OpsFailoverRequestCounts
+	if err := c.db.QueryRowContext(ctx, query, filter.StartTime.UTC(), filter.EndTime.UTC(), platform, groupID,
+		OpsFailoverSwitchEvent, OpsFailoverExhaustedEvent).Scan(&counts.Switched, &counts.Exhausted); err != nil {
+		return OpsFailoverRequestCounts{}, err
+	}
+	return counts, nil
 }
 
 type opsCollectedSystemStats struct {
@@ -967,4 +1037,86 @@ func intPtr(v int) *int {
 func float64Ptr(v float64) *float64 {
 	out := v
 	return &out
+}
+
+// Runtime failover metrics are collected from the same request observation as
+// the structured logs. SQL alert windows use persisted, deduplicated requests.
+var failoverRuntimeMetrics struct {
+	sync.Mutex
+	switches  uint64
+	exhausted map[string]uint64
+	decisions map[string]uint64
+	attempts  [10]uint64
+	duration  [9]uint64
+}
+
+var failoverAttemptBuckets = [...]int{1, 2, 3, 4, 6, 8, 12, 20, 50}
+var failoverDurationBuckets = [...]time.Duration{100 * time.Millisecond, 500 * time.Millisecond, time.Second, 2 * time.Second, 5 * time.Second, 10 * time.Second, 30 * time.Second, time.Minute}
+
+// RecordFailoverMetrics counts a completed failover observation exactly once.
+// switches counts confirmed account changes, exhausted is a bounded reason,
+// and suppressed counts a suppressed decision for the request.
+func RecordFailoverMetrics(attempts, switches int, exhausted string, suppressed bool, elapsed time.Duration) {
+	m := &failoverRuntimeMetrics
+	m.Lock()
+	defer m.Unlock()
+	if m.exhausted == nil {
+		m.exhausted = make(map[string]uint64)
+		m.decisions = make(map[string]uint64)
+	}
+	m.switches += uint64(switches)
+	if switches > 0 {
+		m.decisions["switch"] += uint64(switches)
+	}
+	if exhausted != "" {
+		m.exhausted[exhausted]++
+		if !suppressed {
+			m.decisions["stop"]++
+		}
+	}
+	if suppressed {
+		m.decisions["suppressed"]++
+	}
+	for i, upper := range failoverAttemptBuckets {
+		if attempts <= upper {
+			m.attempts[i]++
+			break
+		}
+		if i == len(failoverAttemptBuckets)-1 {
+			m.attempts[i+1]++
+		}
+	}
+	for i, upper := range failoverDurationBuckets {
+		if elapsed <= upper {
+			m.duration[i]++
+			break
+		}
+		if i == len(failoverDurationBuckets)-1 {
+			m.duration[i+1]++
+		}
+	}
+}
+
+func (c *OpsMetricsCollector) logFailoverMetrics(ctx context.Context) {
+	m := &failoverRuntimeMetrics
+	m.Lock()
+	if m.exhausted == nil {
+		m.Unlock()
+		return
+	}
+	switches, attempts, duration := m.switches, m.attempts, m.duration
+	decisions := make(map[string]uint64, len(m.decisions))
+	exhausted := make(map[string]uint64, len(m.exhausted))
+	for key, value := range m.decisions {
+		decisions[key] = value
+	}
+	for key, value := range m.exhausted {
+		exhausted[key] = value
+	}
+	m.Unlock()
+	logger.FromContext(ctx).Info("gateway.failover_metrics",
+		zap.String("instance_id", c.instanceID), zap.Uint64("failover_switch_total", switches),
+		zap.Any("failover_exhausted_total", exhausted), zap.Any("failover_decision_total", decisions),
+		zap.Any("failover_attempts_per_request", attempts), zap.Any("attempt_bucket_bounds", failoverAttemptBuckets),
+		zap.Any("failover_duration_seconds", duration), zap.Float64s("duration_bucket_bounds_seconds", []float64{0.1, 0.5, 1, 2, 5, 10, 30, 60}))
 }

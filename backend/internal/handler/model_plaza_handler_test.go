@@ -5,6 +5,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -158,6 +159,200 @@ func TestToModelPlazaGroupDTO_UserRateAndFieldWhitelist(t *testing.T) {
 
 func TestToModelPlazaOfficialPricing_NilPassthrough(t *testing.T) {
 	require.Nil(t, toModelPlazaOfficialPricing(nil))
+}
+
+// TestToModelPlazaGroupDTO_CatalogDiscountedAndPeakPricing 覆盖 §4.3 的四类价格
+// 数据与峰价：catalog_pricing / pricing / discounted_pricing / official_pricing /
+// peak_pricing 同时输出，命名沿用现有 camel_case → JSON 下划线约定。
+func TestToModelPlazaGroupDTO_CatalogDiscountedAndPeakPricing(t *testing.T) {
+	g := service.PlazaGroup{
+		ID: 5, Name: "catalog-group", Platform: "deepseek", SubscriptionType: "standard",
+		RateMultiplier: 0.8, CatalogModelCount: 1,
+		Models: []service.PlazaModel{{
+			Name:     "deepseek-v4-flash",
+			Platform: "deepseek",
+			CatalogPricing: &service.ChannelModelPricing{
+				BillingMode: service.BillingModeToken,
+				InputPrice:  testPtr(4e-6),
+				OutputPrice: testPtr(1.6e-5),
+			},
+			Pricing: &service.ChannelModelPricing{
+				BillingMode: service.BillingModeToken,
+				InputPrice:  testPtr(4e-6),
+				OutputPrice: testPtr(1.6e-5),
+			},
+			// service 层用分组默认倍率预计算；handler 会按生效倍率重算。
+			DiscountedPricing: &service.ChannelModelPricing{
+				BillingMode: service.BillingModeToken,
+				InputPrice:  testPtr(3.2e-6),
+			},
+			PeakPricing: &service.PlazaOfficialPricing{
+				InputPrice:  testPtr(8e-6),
+				OutputPrice: testPtr(3.2e-5),
+			},
+			OfficialPricing: &service.PlazaOfficialPricing{
+				InputPrice:  testPtr(5.6e-7),
+				OutputPrice: testPtr(2.24e-6),
+			},
+		}},
+	}
+
+	raw, err := json.Marshal(toModelPlazaGroupDTO(&g, nil))
+	require.NoError(t, err)
+	var decoded map[string]any
+	require.NoError(t, json.Unmarshal(raw, &decoded))
+
+	require.Equal(t, float64(1), decoded["catalog_model_count"], "分组应输出目录价模型数")
+
+	model := decoded["models"].([]any)[0].(map[string]any)
+	for _, key := range []string{"catalog_pricing", "pricing", "discounted_pricing", "peak_pricing", "official_pricing"} {
+		_, exists := model[key]
+		require.Truef(t, exists, "plaza model DTO must expose %q", key)
+	}
+
+	catalog := model["catalog_pricing"].(map[string]any)
+	require.InDelta(t, 4e-6, catalog["input_price"].(float64), 1e-15)
+	require.InDelta(t, 1.6e-5, catalog["output_price"].(float64), 1e-15)
+
+	discounted := model["discounted_pricing"].(map[string]any)
+	require.InDelta(t, 4e-6*0.8, discounted["input_price"].(float64), 1e-15,
+		"折后价 = 目录价 × 分组倍率")
+	require.InDelta(t, 1.6e-5*0.8, discounted["output_price"].(float64), 1e-15)
+
+	peak := model["peak_pricing"].(map[string]any)
+	require.InDelta(t, 8e-6, peak["input_price"].(float64), 1e-15)
+
+	official := model["official_pricing"].(map[string]any)
+	require.InDelta(t, 5.6e-7, official["input_price"].(float64), 1e-15)
+}
+
+// TestToModelPlazaGroupDTO_DiscountedPricingUsesUserRate 覆盖用户专属倍率：
+// 登录用户的折后价按专属倍率重算，而非分组默认倍率。
+func TestToModelPlazaGroupDTO_DiscountedPricingUsesUserRate(t *testing.T) {
+	g := service.PlazaGroup{
+		ID: 6, Name: "vip", Platform: "anthropic", RateMultiplier: 1,
+		Models: []service.PlazaModel{{
+			Name:     "claude-sonnet",
+			Platform: "anthropic",
+			CatalogPricing: &service.ChannelModelPricing{
+				BillingMode: service.BillingModeToken,
+				InputPrice:  testPtr(4e-6),
+			},
+			Pricing: &service.ChannelModelPricing{
+				BillingMode: service.BillingModeToken,
+				InputPrice:  testPtr(4e-6),
+			},
+		}},
+	}
+
+	raw, err := json.Marshal(toModelPlazaGroupDTO(&g, map[int64]float64{6: 0.25}))
+	require.NoError(t, err)
+	var decoded map[string]any
+	require.NoError(t, json.Unmarshal(raw, &decoded))
+
+	require.InDelta(t, 0.25, decoded["user_rate_multiplier"].(float64), 1e-15)
+	model := decoded["models"].([]any)[0].(map[string]any)
+	discounted := model["discounted_pricing"].(map[string]any)
+	require.InDelta(t, 1e-6, discounted["input_price"].(float64), 1e-15,
+		"折后价应按用户专属倍率 0.25 折算")
+	// 目录价与实收单价不随倍率变化。
+	catalog := model["catalog_pricing"].(map[string]any)
+	require.InDelta(t, 4e-6, catalog["input_price"].(float64), 1e-15)
+}
+
+// TestToModelPlazaGroupDTO_NoCatalogPricingYieldsNulls 覆盖未纳入目录价的模型：
+// catalog_pricing / peak_pricing 输出 null（字段恒在，前端据此隐藏目录价列）。
+func TestToModelPlazaGroupDTO_NoCatalogPricingYieldsNulls(t *testing.T) {
+	g := service.PlazaGroup{
+		ID: 7, Name: "plain", Platform: "anthropic", RateMultiplier: 1,
+		Models: []service.PlazaModel{{
+			Name:     "claude-haiku",
+			Platform: "anthropic",
+			Pricing:  &service.ChannelModelPricing{BillingMode: service.BillingModeToken, InputPrice: testPtr(1e-6)},
+		}},
+	}
+
+	raw, err := json.Marshal(toModelPlazaGroupDTO(&g, nil))
+	require.NoError(t, err)
+	var decoded map[string]any
+	require.NoError(t, json.Unmarshal(raw, &decoded))
+
+	require.Equal(t, float64(0), decoded["catalog_model_count"])
+	model := decoded["models"].([]any)[0].(map[string]any)
+	catalog, exists := model["catalog_pricing"]
+	require.True(t, exists, "字段恒在")
+	require.Nil(t, catalog, "未纳入目录价时为 null")
+	peak, exists := model["peak_pricing"]
+	require.True(t, exists, "字段恒在")
+	require.Nil(t, peak, "未启用峰谷时为 null")
+}
+
+// TestModelPlazaRuntime_DefaultEnabledPublic 覆盖默认开放：未写入开关时
+// model_plaza_enabled 视为 true、model_plaza_require_auth 视为 false，
+// 且设置读取失败也保持开放（默认值即 opt-out）。
+func TestModelPlazaRuntime_DefaultEnabledPublic(t *testing.T) {
+	rt := service.NewSettingService(plazaEmptySettingRepo{}, &config.Config{}).
+		GetModelPlazaRuntime(context.Background())
+	require.True(t, rt.Enabled, "未配置时模型广场默认开启")
+	require.False(t, rt.RequireAuth, "默认公开可见，不强制登录")
+
+	// 显式关闭仍然生效。
+	off := service.NewSettingService(plazaToggleSettingRepo{
+		values: map[string]string{service.SettingKeyModelPlazaEnabled: "false"},
+	}, &config.Config{}).GetModelPlazaRuntime(context.Background())
+	require.False(t, off.Enabled, "显式 false 必须关闭")
+
+	// 读取失败时保持开放（fail-open，与 opt-out 默认一致）。
+	failed := service.NewSettingService(plazaFailingSettingRepo{}, &config.Config{}).
+		GetModelPlazaRuntime(context.Background())
+	require.True(t, failed.Enabled, "读取失败时按默认开启处理")
+}
+
+// plazaEmptySettingRepo 是未写入任何设置的 settings 仓储。
+type plazaEmptySettingRepo struct{ service.SettingRepository }
+
+func (plazaEmptySettingRepo) GetMultiple(context.Context, []string) (map[string]string, error) {
+	return map[string]string{}, nil
+}
+
+// plazaToggleSettingRepo 返回预置的开关值。
+type plazaToggleSettingRepo struct {
+	service.SettingRepository
+	values map[string]string
+}
+
+func (r plazaToggleSettingRepo) GetMultiple(context.Context, []string) (map[string]string, error) {
+	return r.values, nil
+}
+
+// plazaFailingSettingRepo 模拟 settings 存储不可用。
+type plazaFailingSettingRepo struct{ service.SettingRepository }
+
+func (plazaFailingSettingRepo) GetMultiple(context.Context, []string) (map[string]string, error) {
+	return nil, errors.New("settings unavailable")
+}
+
+// TestFilterPlazaVisibleGroups_AnonymousHidesExclusiveWithCatalogData 覆盖专属分组
+// 过滤：即使分组带目录价数据，未登录用户也看不到专属分组。
+func TestFilterPlazaVisibleGroups_AnonymousHidesExclusiveWithCatalogData(t *testing.T) {
+	groups := []service.PlazaGroup{
+		{
+			ID: 1, Name: "public", RateMultiplier: 1, CatalogModelCount: 2,
+			Models: []service.PlazaModel{{Name: "public-model", CatalogPricing: &service.ChannelModelPricing{}}},
+		},
+		{
+			ID: 2, Name: "vip", RateMultiplier: 0.5, IsExclusive: true, CatalogModelCount: 3,
+			Models: []service.PlazaModel{{Name: "vip-model", CatalogPricing: &service.ChannelModelPricing{}}},
+		},
+	}
+
+	visible := filterPlazaVisibleGroups(groups, nil, false)
+	require.Len(t, visible, 1, "未登录只见非专属分组")
+	require.Equal(t, int64(1), visible[0].ID)
+
+	// 登录且被授权后才可见。
+	granted := filterPlazaVisibleGroups(groups, map[int64]struct{}{2: {}}, false)
+	require.Len(t, granted, 2)
 }
 
 func TestToModelPlazaGroupDTO_LongContextTiersAndBasis(t *testing.T) {

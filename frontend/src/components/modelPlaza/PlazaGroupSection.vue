@@ -31,6 +31,15 @@
         >
           {{ t('modelPlaza.badges.subscription') }}
         </span>
+        <!-- 目录价模型数：本分组中价格来自「模型价格」页目录价的模型数量 -->
+        <span
+          v-if="catalogModelCount > 0"
+          class="inline-flex items-center gap-1 rounded-md bg-primary-50 px-2 py-0.5 text-xs font-medium text-primary-600 dark:bg-primary-900/20 dark:text-primary-300"
+          :title="t('modelPlaza.table.catalogModelCountHint', { count: catalogModelCount })"
+        >
+          <Icon name="cube" size="xs" class="h-3 w-3" />
+          {{ t('modelPlaza.table.catalogModelCount', { count: catalogModelCount }) }}
+        </span>
       </div>
       <p v-if="group.description" class="mt-2 text-sm text-gray-500 dark:text-dark-400">
         {{ group.description }}
@@ -91,6 +100,15 @@ const props = defineProps<{
 
 const { t } = useI18n()
 const appStore = useAppStore()
+
+/**
+ * 目录价模型数（分组统计，后端 `catalog_model_count`）。
+ * 旧后端不下发该字段时回退按组内模型自身 catalog_pricing 计数。
+ */
+const catalogModelCount = computed(() => {
+  if (typeof props.group.catalog_model_count === 'number') return props.group.catalog_model_count
+  return props.group.models.filter((m) => m.catalog_pricing != null).length
+})
 
 /** 高峰窗口描述(含倍率与服务器时区标注);分组未启用高峰为空串。 */
 const peakWindow = computed(() => {

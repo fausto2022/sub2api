@@ -1598,6 +1598,108 @@ var (
 		Columns:    TLSFingerprintProfilesColumns,
 		PrimaryKey: []*schema.Column{TLSFingerprintProfilesColumns[0]},
 	}
+	// TicketsColumns holds the columns for the "tickets" table.
+	TicketsColumns = []*schema.Column{
+		{Name: "id", Type: field.TypeInt64, Increment: true},
+		{Name: "created_at", Type: field.TypeTime, SchemaType: map[string]string{"postgres": "timestamptz"}},
+		{Name: "updated_at", Type: field.TypeTime, SchemaType: map[string]string{"postgres": "timestamptz"}},
+		{Name: "user_id", Type: field.TypeInt64},
+		{Name: "subject", Type: field.TypeString, Size: 200},
+		{Name: "category", Type: field.TypeString, Size: 40, Default: "general"},
+		{Name: "priority", Type: field.TypeString, Size: 16, Default: "normal"},
+		{Name: "status", Type: field.TypeString, Size: 16, Default: "open"},
+		{Name: "last_reply_at", Type: field.TypeTime, Nullable: true, SchemaType: map[string]string{"postgres": "timestamptz"}},
+		{Name: "last_reply_by", Type: field.TypeString, Nullable: true, Size: 16},
+		{Name: "reply_count", Type: field.TypeInt, Default: 0},
+	}
+	// TicketsTable holds the schema information for the "tickets" table.
+	TicketsTable = &schema.Table{
+		Name:       "tickets",
+		Columns:    TicketsColumns,
+		PrimaryKey: []*schema.Column{TicketsColumns[0]},
+		Indexes: []*schema.Index{
+			{
+				Name:    "ticket_user_id_created_at",
+				Unique:  false,
+				Columns: []*schema.Column{TicketsColumns[3], TicketsColumns[1]},
+			},
+			{
+				Name:    "ticket_status_last_reply_at",
+				Unique:  false,
+				Columns: []*schema.Column{TicketsColumns[7], TicketsColumns[8]},
+			},
+			{
+				Name:    "ticket_created_at",
+				Unique:  false,
+				Columns: []*schema.Column{TicketsColumns[1]},
+			},
+		},
+	}
+	// TicketAttachmentsColumns holds the columns for the "ticket_attachments" table.
+	TicketAttachmentsColumns = []*schema.Column{
+		{Name: "id", Type: field.TypeInt64, Increment: true},
+		{Name: "ticket_id", Type: field.TypeInt64, Nullable: true},
+		{Name: "reply_id", Type: field.TypeInt64, Nullable: true},
+		{Name: "uploader_id", Type: field.TypeInt64},
+		{Name: "storage_key", Type: field.TypeString, SchemaType: map[string]string{"postgres": "text"}},
+		{Name: "storage_kind", Type: field.TypeString, Size: 16, Default: "local"},
+		{Name: "original_name", Type: field.TypeString, Size: 255},
+		{Name: "content_type", Type: field.TypeString, Size: 64},
+		{Name: "byte_size", Type: field.TypeInt64},
+		{Name: "width", Type: field.TypeInt, Nullable: true},
+		{Name: "height", Type: field.TypeInt, Nullable: true},
+		{Name: "sha256", Type: field.TypeString, Size: 64},
+		{Name: "created_at", Type: field.TypeTime, SchemaType: map[string]string{"postgres": "timestamptz"}},
+	}
+	// TicketAttachmentsTable holds the schema information for the "ticket_attachments" table.
+	TicketAttachmentsTable = &schema.Table{
+		Name:       "ticket_attachments",
+		Columns:    TicketAttachmentsColumns,
+		PrimaryKey: []*schema.Column{TicketAttachmentsColumns[0]},
+		Indexes: []*schema.Index{
+			{
+				Name:    "ticketattachment_ticket_id",
+				Unique:  false,
+				Columns: []*schema.Column{TicketAttachmentsColumns[1]},
+			},
+			{
+				Name:    "ticketattachment_reply_id",
+				Unique:  false,
+				Columns: []*schema.Column{TicketAttachmentsColumns[2]},
+			},
+			{
+				Name:    "ticketattachment_created_at",
+				Unique:  false,
+				Columns: []*schema.Column{TicketAttachmentsColumns[12]},
+				Annotation: &entsql.IndexAnnotation{
+					Where: "reply_id IS NULL",
+				},
+			},
+		},
+	}
+	// TicketRepliesColumns holds the columns for the "ticket_replies" table.
+	TicketRepliesColumns = []*schema.Column{
+		{Name: "id", Type: field.TypeInt64, Increment: true},
+		{Name: "ticket_id", Type: field.TypeInt64},
+		{Name: "author_id", Type: field.TypeInt64},
+		{Name: "author_role", Type: field.TypeString, Size: 16},
+		{Name: "content", Type: field.TypeString, SchemaType: map[string]string{"postgres": "text"}},
+		{Name: "email_notified", Type: field.TypeBool, Default: false},
+		{Name: "created_at", Type: field.TypeTime, SchemaType: map[string]string{"postgres": "timestamptz"}},
+	}
+	// TicketRepliesTable holds the schema information for the "ticket_replies" table.
+	TicketRepliesTable = &schema.Table{
+		Name:       "ticket_replies",
+		Columns:    TicketRepliesColumns,
+		PrimaryKey: []*schema.Column{TicketRepliesColumns[0]},
+		Indexes: []*schema.Index{
+			{
+				Name:    "ticketreply_ticket_id_created_at",
+				Unique:  false,
+				Columns: []*schema.Column{TicketRepliesColumns[1], TicketRepliesColumns[6]},
+			},
+		},
+	}
 	// UsageCleanupTasksColumns holds the columns for the "usage_cleanup_tasks" table.
 	UsageCleanupTasksColumns = []*schema.Column{
 		{Name: "id", Type: field.TypeInt64, Increment: true},
@@ -2124,6 +2226,9 @@ var (
 		SettingsTable,
 		SubscriptionPlansTable,
 		TLSFingerprintProfilesTable,
+		TicketsTable,
+		TicketAttachmentsTable,
+		TicketRepliesTable,
 		UsageCleanupTasksTable,
 		UsageLogsTable,
 		UsersTable,
@@ -2251,6 +2356,15 @@ func init() {
 	}
 	TLSFingerprintProfilesTable.Annotation = &entsql.Annotation{
 		Table: "tls_fingerprint_profiles",
+	}
+	TicketsTable.Annotation = &entsql.Annotation{
+		Table: "tickets",
+	}
+	TicketAttachmentsTable.Annotation = &entsql.Annotation{
+		Table: "ticket_attachments",
+	}
+	TicketRepliesTable.Annotation = &entsql.Annotation{
+		Table: "ticket_replies",
 	}
 	UsageCleanupTasksTable.Annotation = &entsql.Annotation{
 		Table: "usage_cleanup_tasks",

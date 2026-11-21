@@ -118,6 +118,24 @@ func (s *OpenAIGatewayService) handleOpenAIAccountUpstreamError(ctx context.Cont
 		}
 		return false
 	}
+	if account != nil && HTTPFailoverMutationEnabled(ctx) {
+		model := firstRequestedModel(canonicalModel)
+		h, b := headers.Clone(), append([]byte(nil), responseBody...)
+		scope := failoverMutationScope(account, statusCode, responseBody, model)
+		if scope == "account" && model != "" && !account.IsPoolMode() && shouldCooldownOpenAITransientUpstreamError(statusCode, responseBody) {
+			scope = "model:" + model
+		}
+		DeferFailoverMutation(ctx, account.ID, scope, func(writeCtx context.Context) {
+			s.handleOpenAIAccountUpstreamError(writeCtx, account, statusCode, h, b, model)
+		})
+		if account.Platform == PlatformOpenAI && isOpenAIHTTPUpstreamAccessStateError(statusCode, "", responseBody) {
+			return true
+		}
+		if isOpenAIImageRateLimitError(statusCode, responseBody) || isOpenAIContextWindowError("", responseBody) {
+			return false
+		}
+		return s.rateLimitService != nil && predictRateLimitDisable(account, statusCode, responseBody, model)
+	}
 	stateCtx, cancel := openAIAccountStateContext(ctx)
 	defer cancel()
 	if account != nil && account.Platform == PlatformOpenAI && isOpenAIHTTPUpstreamAccessStateError(statusCode, "", responseBody) {

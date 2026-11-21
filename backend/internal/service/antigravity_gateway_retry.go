@@ -151,7 +151,7 @@ func (s *AntigravityGatewayService) handleSmartRetry(p antigravityRetryLoopParam
 			p.handleError(p.ctx, p.prefix, p.account, resp.StatusCode, resp.Header, respBody, p.requestedModel, p.groupID, p.sessionHash, p.isStickySession)
 			logger.LegacyPrintf("service.antigravity_gateway", "%s status=%d rate_limited account=%d (no model mapping)", p.prefix, resp.StatusCode, p.account.ID)
 		}
-		s.clearStickySession(p.ctx, p.groupID, p.sessionHash)
+		s.deferRetryStickyClear(p.ctx, p.account.ID, p.groupID, p.sessionHash)
 
 		// 返回账号切换信号，让上层切换账号重试
 		return &smartRetryResult{
@@ -223,7 +223,7 @@ func (s *AntigravityGatewayService) handleSmartRetry(p antigravityRetryLoopParam
 				}
 			}
 
-			retryResp, retryErr := p.httpUpstream.Do(retryReq, p.proxyURL, p.account.ID, p.account.Concurrency)
+			retryResp, retryErr := (failoverAttemptUpstream{p.httpUpstream}).Do(retryReq, p.proxyURL, p.account.ID, p.account.Concurrency)
 			if retryErr == nil && retryResp != nil && retryResp.StatusCode != http.StatusTooManyRequests && retryResp.StatusCode != http.StatusServiceUnavailable {
 				log.Printf("%s status=%d smart_retry_success attempt=%d/%d", p.prefix, retryResp.StatusCode, attempt, maxAttempts)
 				// 重试成功，清除 MODEL_CAPACITY_EXHAUSTED cooldown
@@ -313,7 +313,7 @@ func (s *AntigravityGatewayService) handleSmartRetry(p antigravityRetryLoopParam
 		s.setAntigravityModelRateLimits(p.ctx, p.accountRepo, p.account, modelName, p.prefix, resp.StatusCode, resetAt, true)
 
 		// 清除粘性会话绑定，避免下次请求仍命中限流账号
-		s.clearStickySession(p.ctx, p.groupID, p.sessionHash)
+		s.deferRetryStickyClear(p.ctx, p.account.ID, p.groupID, p.sessionHash)
 
 		// 返回账号切换信号，让上层切换账号重试
 		return &smartRetryResult{
@@ -398,7 +398,7 @@ func (s *AntigravityGatewayService) handleSingleAccountRetryInPlace(
 			break
 		}
 
-		retryResp, retryErr := p.httpUpstream.Do(retryReq, p.proxyURL, p.account.ID, p.account.Concurrency)
+		retryResp, retryErr := (failoverAttemptUpstream{p.httpUpstream}).Do(retryReq, p.proxyURL, p.account.ID, p.account.Concurrency)
 		if retryErr == nil && retryResp != nil && retryResp.StatusCode != http.StatusTooManyRequests && retryResp.StatusCode != http.StatusServiceUnavailable {
 			logger.LegacyPrintf("service.antigravity_gateway", "%s status=%d single_account_503_retry_success attempt=%d/%d total_waited=%v",
 				p.prefix, retryResp.StatusCode, attempt, antigravitySingleAccountSmartRetryMaxAttempts, totalWaited)
@@ -536,7 +536,7 @@ urlFallbackLoop:
 				return nil, err
 			}
 
-			resp, err = p.httpUpstream.Do(upstreamReq, p.proxyURL, p.account.ID, p.account.Concurrency)
+			resp, err = (failoverAttemptUpstream{p.httpUpstream}).Do(upstreamReq, p.proxyURL, p.account.ID, p.account.Concurrency)
 			if err == nil && resp == nil {
 				err = errors.New("upstream returned nil response")
 			}
@@ -777,13 +777,13 @@ func logPrefix(sessionID, accountName string) string {
 	return fmt.Sprintf("[antigravity-Forward] account=%s", accountName)
 }
 
+// shouldFailoverUpstreamError 判断是否应换到下一个账号。
+//
+// P1/T1.1：判定收敛到 ClassifyUpstreamFailure（failover_classifier.go），这里只声明
+// Antigravity 网关族；旧集合 {401,403,429,529} ∪ [500,∞) 由分类器的默认规则表复现，
+// 逐值等价由 failover_legacy_equivalence_test.go 双跑锁定。
 func (s *AntigravityGatewayService) shouldFailoverUpstreamError(statusCode int) bool {
-	switch statusCode {
-	case 401, 403, 429, 529:
-		return true
-	default:
-		return statusCode >= 500
-	}
+	return shouldFailoverStatus(statusCode, FailoverProfileAntigravity)
 }
 
 // isGoogleProjectConfigError 判断（已提取的小写）错误消息是否属于 Google 服务端配置类问题。
@@ -802,11 +802,7 @@ const googleConfigErrorCooldown = 1 * time.Minute
 func tempUnscheduleGoogleConfigError(ctx context.Context, repo AccountRepository, accountID int64, logPrefix string) {
 	until := time.Now().Add(googleConfigErrorCooldown)
 	reason := "400: invalid project resource name (auto temp-unschedule 1m)"
-	if err := repo.SetTempUnschedulable(ctx, accountID, until, reason); err != nil {
-		log.Printf("%s temp_unschedule_failed account=%d error=%v", logPrefix, accountID, err)
-	} else {
-		log.Printf("%s temp_unscheduled account=%d until=%v reason=%q", logPrefix, accountID, until.Format("15:04:05"), reason)
-	}
+	persistRetryTempUnschedule(ctx, repo, accountID, until, reason, logPrefix)
 }
 
 // emptyResponseCooldown 空流式响应的临时封禁时长
@@ -817,9 +813,32 @@ const emptyResponseCooldown = 1 * time.Minute
 func tempUnscheduleEmptyResponse(ctx context.Context, repo AccountRepository, accountID int64, logPrefix string) {
 	until := time.Now().Add(emptyResponseCooldown)
 	reason := "empty stream response (auto temp-unschedule 1m)"
-	if err := repo.SetTempUnschedulable(ctx, accountID, until, reason); err != nil {
-		log.Printf("%s temp_unschedule_failed account=%d error=%v", logPrefix, accountID, err)
+	persistRetryTempUnschedule(ctx, repo, accountID, until, reason, logPrefix)
+}
+
+type retryTempUnscheduleExtender interface {
+	SetTempUnschedulableIfLater(context.Context, int64, time.Time, string) (bool, error)
+}
+
+func persistRetryTempUnschedule(ctx context.Context, repo AccountRepository, accountID int64, until time.Time, reason, logPrefix string) {
+	if repo == nil {
+		return
+	}
+	if DeferFailoverMutation(ctx, accountID, "account", func(writeCtx context.Context) {
+		persistRetryTempUnschedule(writeCtx, repo, accountID, until, reason, logPrefix)
+	}) {
+		return
+	}
+	extended := true
+	var err error
+	if extender, ok := repo.(retryTempUnscheduleExtender); ok {
+		extended, err = extender.SetTempUnschedulableIfLater(ctx, accountID, until, reason)
 	} else {
+		err = repo.SetTempUnschedulable(ctx, accountID, until, reason)
+	}
+	if err != nil {
+		log.Printf("%s temp_unschedule_failed account=%d error=%v", logPrefix, accountID, err)
+	} else if extended {
 		log.Printf("%s temp_unscheduled account=%d until=%v reason=%q", logPrefix, accountID, until.Format("15:04:05"), reason)
 	}
 }
@@ -889,12 +908,26 @@ func (s *AntigravityGatewayService) setAntigravityModelRateLimits(ctx context.Co
 
 	success := false
 	for _, key := range keys {
+		if DeferFailoverMutation(ctx, account.ID, "model:"+key, func(writeCtx context.Context) {
+			if setModelRateLimitByModelName(writeCtx, repo, account.ID, key, prefix, statusCode, resetAt, afterSmartRetry) {
+				s.updateAccountModelRateLimitInCache(writeCtx, account, key, resetAt)
+			}
+		}) {
+			success = true
+			continue
+		}
 		if setModelRateLimitByModelName(ctx, repo, account.ID, key, prefix, statusCode, resetAt, afterSmartRetry) {
 			s.updateAccountModelRateLimitInCache(ctx, account, key, resetAt)
 			success = true
 		}
 	}
 	return success
+}
+
+func (s *AntigravityGatewayService) deferRetryStickyClear(ctx context.Context, accountID, groupID int64, sessionHash string) {
+	if !DeferFailoverMutation(ctx, accountID, "sticky", func(writeCtx context.Context) { s.clearStickySession(writeCtx, groupID, sessionHash) }) {
+		s.clearStickySession(ctx, groupID, sessionHash)
+	}
 }
 
 func (s *AntigravityGatewayService) clearStickySession(ctx context.Context, groupID int64, sessionHash string) {
@@ -1261,6 +1294,9 @@ func (s *AntigravityGatewayService) handleUpstreamError(
 		ra := s.resolveResetTime(resetAt, defaultDur)
 		logger.LegacyPrintf("service.antigravity_gateway", "%s status=429 rate_limited account=%d reset_at=%v reset_in=%v (fallback)",
 			prefix, account.ID, ra.Format("15:04:05"), time.Until(ra).Truncate(time.Second))
+		if DeferFailoverMutation(ctx, account.ID, "account", func(writeCtx context.Context) { _ = s.accountRepo.SetRateLimited(writeCtx, account.ID, ra) }) {
+			return nil
+		}
 		if err := s.accountRepo.SetRateLimited(ctx, account.ID, ra); err != nil {
 			logger.LegacyPrintf("service.antigravity_gateway", "%s status=429 rate_limit_set_failed account=%d error=%v", prefix, account.ID, err)
 		}
@@ -1268,6 +1304,13 @@ func (s *AntigravityGatewayService) handleUpstreamError(
 	}
 	// 其他错误码继续使用 rateLimitService
 	if s.rateLimitService == nil {
+		return nil
+	}
+	if HTTPFailoverMutationEnabled(ctx) {
+		h, b := headers.Clone(), append([]byte(nil), body...)
+		DeferFailoverMutation(ctx, account.ID, "account", func(writeCtx context.Context) {
+			s.rateLimitService.HandleUpstreamError(writeCtx, account, statusCode, h, b)
+		})
 		return nil
 	}
 	shouldDisable := s.rateLimitService.HandleUpstreamError(ctx, account, statusCode, headers, body)

@@ -98,6 +98,11 @@ func tempUnscheduleAccountForTransportError(ctx context.Context, repo AccountRep
 	if account == nil || repo == nil {
 		return
 	}
+	if DeferFailoverMutation(ctx, account.ID, "account", func(writeCtx context.Context) {
+		tempUnscheduleAccountForTransportError(writeCtx, repo, account, safeErr)
+	}) {
+		return
+	}
 	until := time.Now().Add(gatewayTransportErrorTempUnschedDuration)
 	reason := "upstream transport error (proxy/network): " + safeErr
 

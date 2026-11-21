@@ -420,9 +420,9 @@ func (s *GatewayService) handleErrorResponse(ctx context.Context, resp *http.Res
 	shouldDisable := false
 	if s.rateLimitService != nil {
 		if len(requestedModel) > 0 {
-			shouldDisable = s.rateLimitService.HandleUpstreamError(ctx, account, resp.StatusCode, resp.Header, body, requestedModel[0])
+			shouldDisable = s.handleRateLimitFailure(ctx, account, resp.StatusCode, resp.Header, body, requestedModel[0])
 		} else {
-			shouldDisable = s.rateLimitService.HandleUpstreamError(ctx, account, resp.StatusCode, resp.Header, body)
+			shouldDisable = s.handleRateLimitFailure(ctx, account, resp.StatusCode, resp.Header, body)
 		}
 	}
 	if shouldDisable {
@@ -536,9 +536,9 @@ func (s *GatewayService) handleRetryExhaustedSideEffects(ctx context.Context, re
 	// OAuth/Setup Token 账号的 403：标记账号异常
 	if account.IsOAuth() && statusCode == 403 {
 		if len(requestedModel) > 0 {
-			s.rateLimitService.HandleUpstreamError(ctx, account, statusCode, resp.Header, body, requestedModel[0])
+			s.handleRateLimitFailure(ctx, account, statusCode, resp.Header, body, requestedModel[0])
 		} else {
-			s.rateLimitService.HandleUpstreamError(ctx, account, statusCode, resp.Header, body)
+			s.handleRateLimitFailure(ctx, account, statusCode, resp.Header, body)
 		}
 		logger.LegacyPrintf("service.gateway", "Account %d: marked as error after %d retries for status %d", account.ID, maxRetryAttempts, statusCode)
 	} else {
@@ -547,13 +547,56 @@ func (s *GatewayService) handleRetryExhaustedSideEffects(ctx context.Context, re
 	}
 }
 
+// handleFailoverSideEffects 执行一次上游错误之后该做的账号级副作用。
+//
+// P2/T2.2（R-17）：本函数原来是**无条件**调用 RateLimitService（标记账号失败）。
+// 现在它先算决策，再决定「就地执行」还是「延迟给 handler」：
+//
+//   - 门控关闭（默认）→ 与改造前逐字相同（无条件交给 RateLimitService，它自己按
+//     池模式 / custom_error_codes 决定标记），生产行为零变更；
+//   - 门控开启 → 决策说「不算账号问题」就一条都不执行；否则挂到每请求的
+//     FailoverSideEffectSink 上，由 handler 在**确认要换号**之后执行
+//     （handler 放弃换号 = Suppress = 不改写账号状态）。
+//
+// 没有收集器时（例如 OpenAI/Grok 等不走 handler 换号循环的路径）退回就地执行，
+// 绝不因为缺少收集器而丢掉账号健康信息。
 func (s *GatewayService) handleFailoverSideEffects(ctx context.Context, resp *http.Response, account *Account, requestedModel ...string) {
-	body, _ := s.readUpstreamErrorBody(resp)
-	if len(requestedModel) > 0 {
-		s.rateLimitService.HandleUpstreamError(ctx, account, resp.StatusCode, resp.Header, body, requestedModel[0])
+	if HTTPFailoverMutationEnabled(ctx) {
+		body, _ := s.readUpstreamErrorBody(resp)
+		_ = resp.Body.Close()
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		s.handleRateLimitFailure(ctx, account, resp.StatusCode, resp.Header, body, requestedModel...)
 		return
 	}
-	s.rateLimitService.HandleUpstreamError(ctx, account, resp.StatusCode, resp.Header, body)
+	if !FailoverDecisionGateEnabled() {
+		s.applyUpstreamErrorSideEffects(ctx, resp, account, requestedModel...)
+		return
+	}
+
+	decision := buildFailoverDecisionForResponse(resp, account)
+	if policy, _ := ResolvedGatewayFailoverPolicy(ctx); !policy.Legacy() {
+		decision, _ = ClassifyGatewayFailover(ctx, account, &UpstreamFailoverError{StatusCode: resp.StatusCode, ResponseHeaders: resp.Header}, true)
+		if !decision.Switch {
+			return
+		}
+	}
+	if !decision.MarkAccount {
+		logFailoverSuppressed(account, decision, "not_account_failure")
+		return
+	}
+	sink := FailoverSideEffectSinkFrom(ctx)
+	if sink == nil {
+		// 无收集器（非 handler 换号路径）：保持改造前语义，不丢标记。
+		s.applyUpstreamErrorSideEffects(ctx, resp, account, requestedModel...)
+		return
+	}
+	accountRef, respRef := account, resp
+	modelRef := append([]string(nil), requestedModel...)
+	sink.Add(account.ID, decision, func() {
+		writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+		defer cancel()
+		s.applyUpstreamErrorSideEffects(writeCtx, respRef, accountRef, modelRef...)
+	})
 }
 
 // handleRetryExhaustedError 处理重试耗尽后的错误
@@ -864,6 +907,10 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 
 	pendingEventLines := make([]string, 0, 4)
 
+	// P2/T2.1：本次流式尝试的写状态基线。判据由此对象统一给出（R-01）：
+	// 排队期写出的 ping/心跳字节**不**阻止换号，只有语义字节才阻止。
+	writeAttempt := UpstreamWriteStateFor(c).BeginAttempt(c, UseSemanticBytesFor(s.cfg))
+
 	processSSEEvent := func(lines []string) ([]string, string, *sseUsagePatch, error) {
 		if len(lines) == 0 {
 			return nil, "", nil, nil
@@ -1063,7 +1110,10 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 				// 默认 *net.OpError 的 Error() 会泄露内部 IP/端口和上游地址。完整 ev.err
 				// 仅在下方 LegacyPrintf 内部日志中保留供运维诊断。
 				disconnectMsg := "upstream stream disconnected: " + sanitizeStreamError(ev.err)
-				if !c.Writer.Written() {
+				// P2/T2.1（R-01）：判据从 `!c.Writer.Written()` 收敛到写状态对象。
+				// 旧写法把「写过 ping」也算成「写过内容」，导致排队期 ping 之后
+				// 上游断流永远无法换号（客户端被硬失败）。
+				if writeAttempt.CanFailover(false) {
 					logger.LegacyPrintf("service.gateway", "Upstream stream read error before any client output (account=%d), failing over: %v", account.ID, ev.err)
 					body, _ := json.Marshal(map[string]any{
 						"type": "error",
@@ -1109,6 +1159,8 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 							// 否则会漏计当前事件携带的 usage 导致少计费。后续写入由
 							// clientDisconnected 守卫跳过。
 						} else {
+							// P2/T2.1：语义字节记账（客户端能看到内容，之后禁止换号）。
+							UpstreamWriteStateFor(c).WriteSemanticBytes(len(restored))
 							flusher.Flush()
 							lastDataAt = time.Now()
 							resetKeepaliveTimer()
@@ -1164,6 +1216,9 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 				logger.LegacyPrintf("service.gateway", "Client disconnected during keepalive ping, continuing to drain upstream for billing")
 				continue
 			}
+			// P2/T2.1（R-01 的核心）：keepalive 是**心跳字节**，单独记账。
+			// 它不得进入语义字节计数，否则「排队期 ping 之后断流」仍会退化成不可换号。
+			UpstreamWriteStateFor(c).WriteHeartbeatBytes(len(keepaliveBlock))
 			flusher.Flush()
 			lastDataAt = time.Now()
 			resetKeepaliveTimer()

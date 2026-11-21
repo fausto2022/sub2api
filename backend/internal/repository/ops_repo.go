@@ -12,6 +12,9 @@ import (
 	"github.com/lib/pq"
 )
 
+// Use the same phase predicate for raw counts, trends, and pre-aggregation.
+const opsLegacyErrorRows = "error_phase <> '" + service.OpsFailoverTelemetryPhase + "'"
+
 type opsRepository struct {
 	db *sql.DB
 }
@@ -455,7 +458,7 @@ LEFT JOIN users u ON e.user_id = u.id
 LEFT JOIN accounts a ON e.account_id = a.id
 LEFT JOIN groups g ON e.group_id = g.id
 LEFT JOIN api_keys ak ON ak.id = e.api_key_id
-WHERE e.id = $1
+WHERE e.id = $1 AND e.` + opsLegacyErrorRows + `
 LIMIT 1`
 
 	var out service.OpsErrorLogDetail
@@ -894,7 +897,7 @@ func escapeLikePattern(s string) string {
 func buildOpsErrorLogsWhere(filter *service.OpsErrorLogFilter) (string, []any) {
 	clauses := make([]string, 0, 12)
 	args := make([]any, 0, 12)
-	clauses = append(clauses, "1=1")
+	clauses = append(clauses, "1=1", "e."+opsLegacyErrorRows)
 
 	phaseFilter := ""
 	if filter != nil {

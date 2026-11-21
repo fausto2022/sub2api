@@ -381,6 +381,42 @@ func (f TLSFingerprintProfileFunc) Mutate(ctx context.Context, m ent.Mutation) (
 	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.TLSFingerprintProfileMutation", m)
 }
 
+// The TicketFunc type is an adapter to allow the use of ordinary
+// function as Ticket mutator.
+type TicketFunc func(context.Context, *ent.TicketMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f TicketFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.TicketMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.TicketMutation", m)
+}
+
+// The TicketAttachmentFunc type is an adapter to allow the use of ordinary
+// function as TicketAttachment mutator.
+type TicketAttachmentFunc func(context.Context, *ent.TicketAttachmentMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f TicketAttachmentFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.TicketAttachmentMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.TicketAttachmentMutation", m)
+}
+
+// The TicketReplyFunc type is an adapter to allow the use of ordinary
+// function as TicketReply mutator.
+type TicketReplyFunc func(context.Context, *ent.TicketReplyMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f TicketReplyFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.TicketReplyMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.TicketReplyMutation", m)
+}
+
 // The UsageCleanupTaskFunc type is an adapter to allow the use of ordinary
 // function as UsageCleanupTask mutator.
 type UsageCleanupTaskFunc func(context.Context, *ent.UsageCleanupTaskMutation) (ent.Value, error)

@@ -178,6 +178,9 @@ func (s *OpenAIGatewayService) tempUnscheduleOpenAITransportError(ctx context.Co
 	if s.cfg != nil && s.cfg.Gateway.DisableOpenAITransportErrorCooldown {
 		return
 	}
+	if DeferFailoverMutation(ctx, account.ID, "account", func(writeCtx context.Context) { s.tempUnscheduleOpenAITransportError(writeCtx, account, safeErr) }) {
+		return
+	}
 	until := time.Now().Add(openAITransportErrorTempUnschedDuration)
 	reason := "upstream transport error (proxy/network): " + safeErr
 

@@ -2290,6 +2290,13 @@
           />
           <p class="input-hint">{{ t("admin.groups.form.rpmLimitHint") }}</p>
         </div>
+        <!-- 运营管理 · 利润保护（design.md §2.5.1）：分组级最低利润率，null = 继承全局 -->
+        <GroupMarginProtect
+          v-if="!authStore.isSimpleMode && editingGroup"
+          :key="editingGroup.id"
+          ref="editOpsMarginRef"
+          :group-id="editingGroup.id"
+        />
         <ReasoningEffortPolicyFields
           v-if="supportsReasoningEffortPolicyPlatform(editForm.platform)"
           ref="editReasoningEffortPolicyRef"
@@ -4334,6 +4341,8 @@ import GroupRPMOverridesModal from "@/components/admin/group/GroupRPMOverridesMo
 import GroupCapacityBadge from "@/components/common/GroupCapacityBadge.vue";
 import ReasoningEffortPolicyFields from "@/components/admin/group/ReasoningEffortPolicyFields.vue";
 import CodexManifestAccountsField from "@/components/admin/group/CodexManifestAccountsField.vue";
+// 运营管理 · 利润保护区块（分组级最低利润率，design.md §2.5.1）
+import GroupMarginProtect from "@/components/opsmgmt/GroupMarginProtect.vue";
 import PricingEntryCard from "@/components/admin/channel/PricingEntryCard.vue";
 import type { PricingFormEntry } from "@/components/admin/channel/types";
 import {
@@ -4922,6 +4931,8 @@ type ReasoningEffortPolicyFieldsExpose = {
 };
 const createReasoningEffortPolicyRef = ref<ReasoningEffortPolicyFieldsExpose | null>(null);
 const editReasoningEffortPolicyRef = ref<ReasoningEffortPolicyFieldsExpose | null>(null);
+/** 运营管理 · 利润保护区块的保存入口（提交分组表单时一并落盘）。 */
+const editOpsMarginRef = ref<InstanceType<typeof GroupMarginProtect> | null>(null);
 
 // 固定账号获取 Codex Model Manifest（仅 openai 分组编辑对话框）
 type CodexManifestAccountsFieldExpose = {
@@ -6438,6 +6449,8 @@ const handleUpdateGroup = async () => {
         }
       : payload;
     await adminAPI.groups.update(editingGroup.value.id, requestData);
+    // 运营管理 · 利润保护：区块自持请求，未改动时 save() 直接返回 true。
+    await editOpsMarginRef.value?.save();
     appStore.showSuccess(t("admin.groups.groupUpdated"));
     closeEditModal();
     loadGroups();

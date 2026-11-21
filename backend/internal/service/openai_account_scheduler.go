@@ -417,7 +417,7 @@ func (s *defaultOpenAIAccountScheduler) Select(
 			if hasGroupMetadata && s.service != nil {
 				groupCompatible = s.service.openAIAccountMatchesSchedulingGroup(selection.Account, req.GroupID)
 			}
-			if !groupCompatible ||
+			if excludesFailoverAccount(ctx, req.ExcludedIDs, selection.Account.ID) || !groupCompatible ||
 				!compatible || !s.isAccountTransportCompatible(selection.Account, req.RequiredTransport) {
 				if selection.ReleaseFunc != nil {
 					selection.ReleaseFunc()
@@ -519,8 +519,8 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 	if accountID <= 0 {
 		return nil, false, nil
 	}
-	if req.ExcludedIDs != nil {
-		if _, excluded := req.ExcludedIDs[accountID]; excluded {
+	if req.ExcludedIDs != nil || failoverRetryAccount(ctx) > 0 {
+		if excludesFailoverAccount(ctx, req.ExcludedIDs, accountID) {
 			return nil, false, nil
 		}
 	}
@@ -1280,8 +1280,8 @@ func (s *defaultOpenAIAccountScheduler) tryFallbackToWeightedSticky(
 		if accountID <= 0 {
 			continue
 		}
-		if req.ExcludedIDs != nil {
-			if _, excluded := req.ExcludedIDs[accountID]; excluded {
+		if req.ExcludedIDs != nil || failoverRetryAccount(ctx) > 0 {
+			if excludesFailoverAccount(ctx, req.ExcludedIDs, accountID) {
 				continue
 			}
 		}
@@ -1440,8 +1440,8 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 	loadReq := make([]AccountWithConcurrency, 0, len(accounts))
 	for i := range accounts {
 		account := &accounts[i]
-		if req.ExcludedIDs != nil {
-			if _, excluded := req.ExcludedIDs[account.ID]; excluded {
+		if req.ExcludedIDs != nil || failoverRetryAccount(ctx) > 0 {
+			if excludesFailoverAccount(ctx, req.ExcludedIDs, account.ID) {
 				filterStats.exclude("excluded")
 				continue
 			}
@@ -2376,6 +2376,10 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 		decision.Layer = openAIAccountScheduleLayerLoadBalance
 		if selection, hit, err := s.selectLegacyAccountByPreviousResponse(ctx, groupID, previousResponseID, sessionHash, requestedModel, excludedIDs, requiredTransport, requiredCapability, requiredImageCapability, requireCompact, platform); err != nil {
 			return nil, decision, err
+		} else if hit && excludesFailoverAccount(ctx, excludedIDs, selection.Account.ID) {
+			if selection.ReleaseFunc != nil {
+				selection.ReleaseFunc()
+			}
 		} else if hit {
 			decision.Layer = openAIAccountScheduleLayerPreviousResponse
 			decision.StickyPreviousHit = true

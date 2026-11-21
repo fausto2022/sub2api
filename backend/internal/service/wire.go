@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	dbent "github.com/Wei-Shaw/sub2api/ent"
@@ -562,8 +564,10 @@ func ProvideOpsAlertEvaluatorService(
 	redisClient *redis.Client,
 	cfg *config.Config,
 	proxyRepo ProxyRepository,
+	collector *OpsMetricsCollector,
 ) *OpsAlertEvaluatorService {
 	svc := NewOpsAlertEvaluatorService(opsService, opsRepo, emailService, redisClient, cfg, proxyRepo)
+	svc.SetFailoverMetricsCollector(collector)
 	svc.Start()
 	return svc
 }
@@ -937,6 +941,14 @@ var ProviderSet = wire.NewSet(
 	ProvideOpsScheduledReportService,
 	NewEmailService,
 	NewNotificationEmailService,
+	NewTicketService,
+	ProvideTicketUserReader,
+	wire.Bind(new(TicketNotifier), new(*NotificationEmailService)),
+	NewTicketAttachmentService,
+	ProvideTicketAttachmentStorage,
+	ProvideTicketAttachmentTicketReader,
+	// 运营管理（上游对接 / 利润保护 / 扩池 / 看板）：表前缀 ops_mgmt_，前缀与既有 ops_* 模块区分
+	ProvideOpsManagementService,
 	ProvideEmailQueueService,
 	NewTurnstileService,
 	NewTencentCaptchaService,
@@ -979,6 +991,9 @@ var ProviderSet = wire.NewSet(
 	NewChannelService,
 	wire.Bind(new(ChannelCacheInvalidator), new(*ChannelService)),
 	NewModelPricingResolver,
+	// 内置模型价格与人民币口径管理服务（依赖 PricingService + settings 仓储，
+	// 峰谷时段设置持久化到 settings 的 peak_pricing_settings 键）
+	NewModelPricingAdminServiceWithSettings,
 	NewModelPlazaService,
 	NewContentModerationService,
 	NewAffiliateService,
@@ -1092,4 +1107,56 @@ func ProvideClaudeResetCreditService(accounts AccountRepository, tokens *ClaudeT
 	s := NewClaudeResetCreditService(accounts, tokens, proxies, settings)
 	s.ConfigureRedemption(idem, locks)
 	return s
+}
+
+// ProvideTicketUserReader 把用户仓储适配为工单服务所需的最小只读接口。
+// 不能用 wire.Bind(new(TicketUserReader), new(UserRepository))：wire 要求被绑定的
+// 具体类型的 provider 与 Bind 处于同一 ProviderSet，而 UserRepository 的 provider
+// 在 repository.ProviderSet 中，跨包绑定会让 generate 直接报
+// "ProviderSet does not include a provider for UserRepository"。
+func ProvideTicketUserReader(repo UserRepository) TicketUserReader {
+	return repo
+}
+
+// ProvideTicketAttachmentTicketReader 把工单仓储适配为附件读取鉴权所需的最小只读接口
+// （理由同 ProvideTicketUserReader：跨 ProviderSet 不能用 wire.Bind）。
+func ProvideTicketAttachmentTicketReader(repo TicketRepository) TicketAttachmentTicketReader {
+	return repo
+}
+
+// ProvideTicketAttachmentStorage 构造工单附件存储。
+//
+// 默认本地磁盘（design.md §1.2）：{data_dir}/ticket-attachments，除非
+// TICKET_ATTACHMENT_STORAGE_DIR 显式覆盖。S3 实现作为后续可选项预留
+// （TicketAttachmentStorageKindS3），接入时只需在此按配置切换返回实现。
+func ProvideTicketAttachmentStorage(cfg *config.Config) TicketAttachmentStorage {
+	if override := strings.TrimSpace(os.Getenv("TICKET_ATTACHMENT_STORAGE_DIR")); override != "" {
+		return NewLocalTicketAttachmentStorage(override)
+	}
+	root := DefaultTicketAttachmentStorageDir
+	if cfg != nil {
+		if dataDir := strings.TrimSpace(cfg.Pricing.DataDir); dataDir != "" {
+			root = filepath.Join(dataDir, "ticket-attachments")
+		}
+	}
+	return NewLocalTicketAttachmentStorage(root)
+}
+
+// ProvideOpsManagementService 构造运营管理服务并启动定时同步。
+//
+// 依赖：
+//   - OpsMgmtRepository（repository.NewOpsMgmtRepository，原生 SQL）
+//   - SecretEncryptor（复用 security_secret / AES-256-GCM 机制加密上游密码与 Key）
+//   - *ChannelService（扩池 = 创建本地 Channel，需要缓存失效与命名校验）
+//
+// 定时同步由 sync 服务内部 ticker 驱动（按站点 sync_interval_minutes，默认 30 分钟），
+// 停止依赖进程退出，与仓库内其它 Start 型服务一致。
+func ProvideOpsManagementService(
+	repo OpsMgmtRepository,
+	encryptor SecretEncryptor,
+	channelService *ChannelService,
+) *OpsManagementService {
+	svc := NewOpsManagementService(repo, encryptor, NewOpsUpstreamClient(nil), channelService)
+	svc.StartSyncScheduler(context.Background())
+	return svc
 }

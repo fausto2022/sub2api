@@ -702,3 +702,134 @@ func (s *notificationEmailTestSMTPServer) handleConn(conn net.Conn) {
 		}
 	}
 }
+
+func TestNotificationEmailTicketReplyEventIsListedAndPreviewable(t *testing.T) {
+	ctx := context.Background()
+	svc := NewNotificationEmailService(newNotificationEmailMemorySettingRepo(), nil)
+
+	infos := svc.ListEventInfos()
+	events := make(map[string]NotificationEmailEventInfo, len(infos))
+	for _, info := range infos {
+		events[info.Event] = info
+	}
+	info, ok := events[NotificationEmailEventTicketReply]
+	require.True(t, ok)
+	require.Equal(t, "support", info.Category)
+	require.False(t, info.Optional, "ticket replies are transactional and cannot be unsubscribed")
+	for _, placeholder := range []string{"recipient_name", "site_name", "ticket_subject", "ticket_id", "reply_content", "ticket_url"} {
+		require.Contains(t, info.Placeholders, placeholder)
+	}
+
+	variables := map[string]string{
+		"ticket_subject": "无法调用 API",
+		"ticket_id":      "1024",
+		"reply_content":  "问题已修复，请重试",
+		"ticket_url":     "https://example.com/tickets/1024",
+	}
+
+	zhPreview, err := svc.PreviewTemplate(ctx, NotificationEmailPreviewInput{
+		Event:     NotificationEmailEventTicketReply,
+		Locale:    "zh-CN",
+		Variables: variables,
+	})
+	require.NoError(t, err)
+	require.Contains(t, zhPreview.Subject, "工单 #1024")
+	require.Contains(t, zhPreview.HTML, "无法调用 API")
+	require.Contains(t, zhPreview.HTML, "问题已修复，请重试")
+	require.Contains(t, zhPreview.HTML, "https://example.com/tickets/1024")
+
+	enPreview, err := svc.PreviewTemplate(ctx, NotificationEmailPreviewInput{
+		Event:     NotificationEmailEventTicketReply,
+		Locale:    "en",
+		Variables: variables,
+	})
+	require.NoError(t, err)
+	require.Contains(t, enPreview.Subject, "ticket #1024")
+	require.Contains(t, enPreview.HTML, "无法调用 API")
+	require.Contains(t, enPreview.HTML, "问题已修复，请重试")
+}
+
+func TestNotificationEmailTicketReplyEscapesReplyContent(t *testing.T) {
+	ctx := context.Background()
+	svc := NewNotificationEmailService(newNotificationEmailMemorySettingRepo(), nil)
+
+	preview, err := svc.PreviewTemplate(ctx, NotificationEmailPreviewInput{
+		Event:  NotificationEmailEventTicketReply,
+		Locale: "en",
+		Variables: map[string]string{
+			"ticket_subject": "subject",
+			"ticket_id":      "7",
+			"reply_content":  `<script>alert("x")</script>`,
+			"ticket_url":     "javascript:alert(1)",
+		},
+	})
+	require.NoError(t, err)
+	require.Contains(t, preview.HTML, `&lt;script&gt;alert(&#34;x&#34;)&lt;/script&gt;`)
+	require.NotContains(t, preview.HTML, `<script>alert("x")</script>`)
+	require.NotContains(t, preview.HTML, "javascript:alert(1)")
+}
+
+func TestNotificationEmailTicketReplyRuntimeVariablesBuildTicketURL(t *testing.T) {
+	ctx := context.Background()
+	repo := newNotificationEmailMemorySettingRepo()
+	require.NoError(t, repo.SetMultiple(ctx, map[string]string{
+		SettingKeyAPIBaseURL: "https://app.example.com/",
+		SettingKeySiteName:   "Acme",
+	}))
+	svc := NewNotificationEmailService(repo, nil)
+
+	variables := svc.runtimeVariables(ctx, NotificationEmailEventTicketReply, "en", NotificationEmailSendInput{
+		RecipientEmail: "user@example.com",
+		Variables: map[string]string{
+			"ticket_subject": "Cannot call the API",
+			"ticket_id":      "42",
+			"reply_content":  "Fixed",
+		},
+	})
+	require.Equal(t, "https://app.example.com/tickets/42", variables["ticket_url"])
+	require.Equal(t, "Cannot call the API", variables["ticket_subject"])
+	require.Equal(t, "Fixed", variables["reply_content"])
+	require.Equal(t, "Acme", variables["site_name"])
+
+	// 调用方未提供变量时不得泄漏预览样本值。
+	empty := svc.runtimeVariables(ctx, NotificationEmailEventTicketReply, "en", NotificationEmailSendInput{})
+	require.Empty(t, empty["ticket_subject"])
+	require.Empty(t, empty["reply_content"])
+	require.Empty(t, empty["ticket_url"])
+}
+
+func TestNotificationEmailTicketReplySendFailureReturnsDeliveryError(t *testing.T) {
+	ctx := context.Background()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	host, port, err := net.SplitHostPort(listener.Addr().String())
+	require.NoError(t, err)
+	require.NoError(t, listener.Close())
+
+	repo := newNotificationEmailMemorySettingRepo()
+	require.NoError(t, repo.SetMultiple(ctx, map[string]string{
+		SettingKeySMTPHost:     host,
+		SettingKeySMTPPort:     port,
+		SettingKeySMTPFrom:     "noreply@example.com",
+		SettingKeySMTPFromName: "Sub2API",
+		SettingKeySMTPUseTLS:   "false",
+	}))
+	emailSvc := NewEmailService(repo, nil)
+	svc := NewNotificationEmailService(repo, emailSvc)
+
+	err = svc.Send(ctx, NotificationEmailSendInput{
+		Event:          NotificationEmailEventTicketReply,
+		RecipientEmail: "user@example.com",
+		RecipientName:  "User",
+		UserID:         7,
+		SourceType:     "ticket_reply",
+		SourceID:       "11",
+		Variables: map[string]string{
+			"ticket_subject": "Cannot call the API",
+			"ticket_id":      "3",
+			"reply_content":  "Fixed",
+		},
+	})
+	require.Error(t, err)
+	require.True(t, isNotificationEmailDeliveryError(err))
+}

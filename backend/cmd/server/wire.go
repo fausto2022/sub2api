@@ -58,9 +58,32 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 		provideCleanup,
 
 		// Application struct
-		wire.Struct(new(Application), "Server", "PromptAudit", "PluginManager", "Cleanup"),
+		provideApplication,
 	)
 	return nil, nil
+}
+
+// Start the audit worker only after the application graph has been built.
+func provideApplication(server *http.Server, prompt *securityaudit.PromptService, plugins *service.PluginManager, cleanup func(), cfg *config.Config, writer service.UpstreamCostAttemptWriter, gateway *handler.GatewayHandler, openAI *handler.OpenAIGatewayHandler) (*Application, error) {
+	app := &Application{Server: server, PromptAudit: prompt, PluginManager: plugins, Cleanup: cleanup}
+	if cfg == nil || !cfg.Gateway.FailoverPolicy.CostAttempts.Enabled {
+		return app, nil
+	}
+	recorder, err := service.NewUpstreamCostAttemptRecorder(true, writer, service.UpstreamCostAttemptRecorderOptions{})
+	if err != nil {
+		return nil, err
+	}
+	gateway.InstallUpstreamCostAttemptRecorder(recorder)
+	openAI.InstallUpstreamCostAttemptRecorder(recorder)
+	app.Cleanup = func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := recorder.Stop(ctx); err != nil {
+			log.Printf("[Cleanup] UpstreamCostAttemptRecorder drain: %v", err)
+		}
+		cancel()
+		cleanup()
+	}
+	return app, nil
 }
 
 func providePrivacyClientFactory() service.PrivacyClientFactory {

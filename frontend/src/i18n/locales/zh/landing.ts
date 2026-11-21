@@ -3,113 +3,108 @@ export default {
     title: '图片批量生成',
     description: '一次提交多条提示词，任务完成后可统一下载图片结果'
   },
-  // Home Page
+  // Home Page — 默认落地页（自定义首页 / 紧凑首页模式不使用这些键）
   home: {
-    viewOnGithub: '在 GitHub 上查看',
+    skipToContent: '跳到主要内容',
     viewDocs: '查看文档',
     docs: '文档',
     switchToLight: '切换到浅色模式',
     switchToDark: '切换到深色模式',
     dashboard: '控制台',
     login: '登录',
-    getStarted: '立即开始',
     goToDashboard: '进入控制台',
-    // 新增：面向用户的价值主张
-    heroSubtitle: '一个密钥，畅用多个 AI 模型',
-    heroDescription: '无需管理多个订阅账号，一站式接入 Claude、GPT、Gemini 等主流 AI 服务',
-    tags: {
-      subscriptionToApi: '订阅转 API',
-      stickySession: '会话保持',
-      realtimeBilling: '按量计费'
+    nav: {
+      ariaLabel: '主导航',
+      capabilities: '能力',
+      models: '模型',
+      pricing: '计费'
     },
-    // 用户痛点区块
-    painPoints: {
-      title: '你是否也遇到这些问题？',
+    hero: {
+      badge: '统一 API 网关',
+      title: '一个 API，接入全系前沿模型',
+      description: '统一 OpenAI / Claude / Gemini 兼容协议，按量计费、密钥与配额管理一站完成。',
+      primaryCtaGuest: '免费注册',
+      secondaryCtaModels: '查看模型',
+      secondaryCtaDocs: '查看文档',
+      secondaryCtaLearn: '了解能力',
+      chips: {
+        protocol: 'OpenAI / Claude / Gemini 兼容',
+        billing: '按量计费',
+        keys: '密钥与配额'
+      }
+    },
+    code: {
+      title: '快速开始',
+      copy: '复制',
+      copied: '已复制',
+      copyLabel: '复制示例代码',
+      endpointLabel: 'API 地址',
+      note: '示例中的 base URL 取自站点公开设置，模型 ID 以站点实际提供的列表为准。'
+    },
+    capabilities: {
+      title: '为生产环境准备的能力',
+      subtitle: '接入、计费、运维与用量核算在同一条链路上完成。',
       items: {
-        expensive: {
-          title: '订阅费用高',
-          desc: '每个 AI 服务都要单独订阅，每月支出越来越多'
+        unifiedAccess: {
+          title: '多模型统一接入',
+          desc: '一个密钥调用多家供应商的模型，无需分别申请与维护账号。'
         },
-        complex: {
-          title: '多账号难管理',
-          desc: '不同平台的账号、密钥分散各处，管理起来很麻烦'
+        protocolCompat: {
+          title: '协议兼容',
+          desc: '同时兼容 OpenAI、Claude 与 Gemini 的请求格式，现有 SDK 与工具可直接复用。'
         },
-        unstable: {
-          title: '服务不稳定',
-          desc: '单一账号容易触发限制，影响正常使用'
+        usageBilling: {
+          title: '按量计费',
+          desc: '按实际消耗的 tokens 计费，支持余额与订阅两种付费方式（以站点开关为准）。'
         },
-        noControl: {
-          title: '用量无法控制',
-          desc: '不知道钱花在哪了，也无法限制团队成员的使用'
+        keysQuota: {
+          title: '密钥与配额',
+          desc: '为每个密钥设置额度、限额与有效期，按项目隔离调用。'
+        },
+        channelMonitor: {
+          title: '渠道监控',
+          desc: '查看上游渠道的健康与响应情况，异常时按配置切换。'
+        },
+        usageAnalytics: {
+          title: '用量与账单',
+          desc: '按模型与日期查看请求量、token 消耗与费用明细。'
         }
       }
     },
-    // 解决方案区块
-    solutions: {
-      title: '我们帮你解决',
-      subtitle: '简单三步，开始省心使用 AI'
-    },
-    features: {
-      unifiedGateway: '一键接入',
-      unifiedGatewayDesc: '获取一个 API 密钥，即可调用所有已接入的 AI 模型，无需分别申请。',
-      multiAccount: '稳定可靠',
-      multiAccountDesc: '智能调度多个上游账号，自动切换和负载均衡，告别频繁报错。',
-      balanceQuota: '用多少付多少',
-      balanceQuotaDesc: '按实际使用量计费，支持设置配额上限，团队用量一目了然。'
-    },
-    // 优势对比
-    comparison: {
-      title: '为什么选择我们？',
-      headers: {
-        feature: '对比项',
-        official: '官方订阅',
-        us: '本平台'
-      },
-      items: {
-        pricing: {
-          feature: '付费方式',
-          official: '固定月费，用不完也付',
-          us: '按量付费，用多少付多少'
-        },
-        models: {
-          feature: '模型选择',
-          official: '单一服务商',
-          us: '多模型随意切换'
-        },
-        management: {
-          feature: '账号管理',
-          official: '每个服务单独管理',
-          us: '统一密钥，一站管理'
-        },
-        stability: {
-          feature: '服务稳定性',
-          official: '单账号易触发限制',
-          us: '多账号池，自动切换'
-        },
-        control: {
-          feature: '用量控制',
-          official: '无法限制',
-          us: '可设配额、查明细'
-        }
+    models: {
+      title: '模型矩阵',
+      subtitle: '按供应商分组的常见模型，实际可用清单以站点为准。',
+      note: '名称与图标仅用于说明接入范围，不代表当前站点已上架全部模型。',
+      groups: {
+        openai: 'OpenAI',
+        anthropic: 'Anthropic',
+        google: 'Google',
+        deepseek: 'DeepSeek',
+        qwen: '通义千问',
+        moonshot: 'Kimi',
+        zhipu: '智谱 GLM'
       }
     },
-    providers: {
-      title: '已支持的 AI 模型',
-      description: '一个 API，多种选择',
-      supported: '已支持',
-      soon: '即将推出',
-      claude: 'Claude',
-      gemini: 'Gemini',
-      antigravity: 'Antigravity',
-      more: '更多'
-    },
-    // CTA 区块
-    cta: {
-      title: '准备好开始了吗？',
-      description: '注册即可获得免费试用额度，体验一站式 AI 服务',
-      button: '免费注册'
+    pricing: {
+      title: '按量计费，用多少付多少',
+      signUp: '免费注册',
+      topUp: '充值余额',
+      topUpOrSubscribe: '充值或订阅',
+      subscribe: '查看订阅',
+      dashboard: '进入控制台',
+      manage: '查看用量与账单',
+      descriptionGuest: '注册并登录后即可创建密钥调用模型，用量与账单在控制台实时可查。',
+      descriptionBoth: '充值余额或购买订阅后即可调用，用量与账单在控制台实时可查。',
+      descriptionTopUp: '充值余额后按实际用量计费，用量与账单在控制台实时可查。',
+      descriptionSubscribe: '订阅由站点管理员开通，额度与到期时间在控制台可查。',
+      descriptionNone: '本站点暂未开放在线充值或订阅，请联系站点管理员获取额度。'
     },
     footer: {
+      resources: '资源',
+      contact: '联系方式',
+      contactEmpty: '如需帮助，请通过站点管理员公布的方式联系。',
+      version: '版本',
+      builtFor: '为开发者提供统一的模型接入层。',
       allRightsReserved: '保留所有权利。'
     }
   },

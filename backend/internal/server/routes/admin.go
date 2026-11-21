@@ -87,6 +87,9 @@ func RegisterAdminRoutes(
 		// 运维监控（Ops）
 		registerOpsRoutes(admin, h)
 
+		// 运营管理（上游对接 / 利润保护 / 扩池 / 看板），前缀 /admin/opsmgmt
+		registerOpsMgmtRoutes(admin, h)
+
 		// 系统管理
 		registerSystemRoutes(admin, h)
 
@@ -132,6 +135,12 @@ func RegisterAdminRoutes(
 
 		// 操作审计日志
 		registerAuditLogRoutes(admin, h, stepUpAuth)
+
+		// 工单管理
+		registerTicketRoutes(admin, h)
+
+		// 内置模型价格与人民币计费口径
+		registerModelPricingRoutes(admin, h)
 	}
 }
 
@@ -187,6 +196,54 @@ func registerAdminAPIKeyRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
 	apiKeys := admin.Group("/api-keys")
 	{
 		apiKeys.PUT("/:id", h.Admin.APIKey.UpdateGroup)
+	}
+}
+
+// registerOpsMgmtRoutes 注册运营管理路由（design.md 第二部分 v3.0）。
+//
+// 前缀用 /admin/opsmgmt，与既有可观测性模块的 /admin/ops 严格分开：
+//   - 站点：CRUD + 登录测试 + 手动同步（异步任务）+ 分组/账号快照
+//   - 扩池 = 对接渠道：POST /expand（单条同步创建 / items 批量异步）
+//   - 利润：检查历史 + 手动评估（异步任务）+ Channel 恢复
+//   - 配置：全局 settings + 分组级最低利润率（含 /admin/groups/:id/opsmgmt-margin 别名）
+func registerOpsMgmtRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
+	mgmt := admin.Group("/opsmgmt")
+	{
+		// 运营看板
+		mgmt.GET("/dashboard", h.Admin.OpsMgmt.GetDashboard)
+
+		// 上游站点
+		mgmt.GET("/sites", h.Admin.OpsMgmt.ListSites)
+		mgmt.POST("/sites", h.Admin.OpsMgmt.CreateSite)
+		mgmt.GET("/sites/:id", h.Admin.OpsMgmt.GetSite)
+		mgmt.PUT("/sites/:id", h.Admin.OpsMgmt.UpdateSite)
+		mgmt.DELETE("/sites/:id", h.Admin.OpsMgmt.DeleteSite)
+		mgmt.POST("/sites/:id/test", h.Admin.OpsMgmt.TestSite)
+		mgmt.POST("/sites/:id/sync", h.Admin.OpsMgmt.SyncSite)
+		mgmt.GET("/sites/:id/groups", h.Admin.OpsMgmt.ListSiteGroups)
+		mgmt.GET("/sites/:id/accounts", h.Admin.OpsMgmt.ListSiteAccounts)
+		mgmt.PUT("/sites/:id/groups/:remote_group_id/margin", h.Admin.OpsMgmt.SetSiteGroupMargin)
+
+		// 扩池（对接渠道）与异步任务
+		mgmt.POST("/expand", h.Admin.OpsMgmt.Expand)
+		mgmt.GET("/tasks", h.Admin.OpsMgmt.ListTasks)
+		mgmt.GET("/tasks/:id", h.Admin.OpsMgmt.GetTask)
+
+		// 利润管理
+		mgmt.GET("/profit/checks", h.Admin.OpsMgmt.ListProfitChecks)
+		mgmt.POST("/profit/evaluate", h.Admin.OpsMgmt.EvaluateProfit)
+		mgmt.GET("/guard-locks", h.Admin.OpsMgmt.ListGuardLocks)
+		mgmt.POST("/channels/:id/restore", h.Admin.OpsMgmt.RestoreChannel)
+		mgmt.GET("/channels/auto-disabled", h.Admin.OpsMgmt.ListAutoDisabledChannels)
+
+		// 全局配置与分组级最低利润率
+		mgmt.GET("/settings", h.Admin.OpsMgmt.GetSettings)
+		mgmt.PUT("/settings", h.Admin.OpsMgmt.UpdateSettings)
+		mgmt.GET("/group-margins", h.Admin.OpsMgmt.ListGroupMargins)
+		mgmt.PUT("/group-margins/:id", h.Admin.OpsMgmt.SetGroupMargin)
+
+		// design.md §2.8 约定的分组级入口别名（挂在 /admin/groups 下）。
+		admin.PUT("/groups/:id/opsmgmt-margin", h.Admin.OpsMgmt.SetGroupMargin)
 	}
 }
 
@@ -905,5 +962,36 @@ func channelMonitorModeV2Guard(settingService *service.SettingService) gin.Handl
 			return
 		}
 		c.Next()
+	}
+}
+
+// registerTicketRoutes 注册工单管理端路由（静态 /stats 先于参数路由注册）。
+func registerTicketRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
+	tickets := admin.Group("/tickets")
+	{
+		tickets.GET("", h.Admin.Ticket.List)
+		tickets.GET("/stats", h.Admin.Ticket.Stats)
+		tickets.GET("/:id", h.Admin.Ticket.Get)
+		tickets.POST("/:id/replies", h.Admin.Ticket.Reply)
+		tickets.PUT("/:id", h.Admin.Ticket.Update)
+	}
+}
+
+// registerModelPricingRoutes 注册内置模型价格与人民币计费口径管理路由。
+func registerModelPricingRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
+	modelPricing := admin.Group("/model-pricing")
+	{
+		modelPricing.GET("", h.Admin.ModelPricing.List)
+		modelPricing.PUT("/overrides/:model", h.Admin.ModelPricing.UpdateOverride)
+		modelPricing.DELETE("/overrides/:model", h.Admin.ModelPricing.DeleteOverride)
+		modelPricing.GET("/currency", h.Admin.ModelPricing.GetCurrency)
+		modelPricing.PUT("/currency", h.Admin.ModelPricing.UpdateCurrency)
+		modelPricing.PUT("/currency/models/:model", h.Admin.ModelPricing.UpsertCurrencyModel)
+		modelPricing.DELETE("/currency/models/:model", h.Admin.ModelPricing.DeleteCurrencyModel)
+		// 模型目录价：新增（可目录外）/删除自定义模型、峰谷时段读写（design.md §2.2/§3.2）。
+		modelPricing.POST("/models", h.Admin.ModelPricing.CreateModel)
+		modelPricing.DELETE("/models/:model", h.Admin.ModelPricing.DeleteModel)
+		modelPricing.GET("/peak-settings", h.Admin.ModelPricing.GetPeakSettings)
+		modelPricing.PUT("/peak-settings", h.Admin.ModelPricing.UpdatePeakSettings)
 	}
 }

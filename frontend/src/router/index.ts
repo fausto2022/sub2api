@@ -420,6 +420,32 @@ const routes: RouteRecordRaw[] = [
     }
   },
 
+  // ==================== Ticket Routes (user) ====================
+  {
+    path: '/tickets',
+    name: 'Tickets',
+    component: () => import('@/views/user/TicketsView.vue'),
+    meta: {
+      requiresAuth: true,
+      requiresAdmin: false,
+      title: 'Tickets',
+      titleKey: 'tickets.title',
+      descriptionKey: 'tickets.description'
+    }
+  },
+  {
+    path: '/tickets/:id',
+    name: 'TicketDetail',
+    component: () => import('@/views/user/TicketDetailView.vue'),
+    meta: {
+      requiresAuth: true,
+      requiresAdmin: false,
+      title: 'Ticket Detail',
+      titleKey: 'tickets.title',
+      descriptionKey: 'tickets.description'
+    }
+  },
+
   // ==================== Admin Routes ====================
   {
     path: '/admin',
@@ -447,6 +473,59 @@ const routes: RouteRecordRaw[] = [
       title: 'Ops Monitoring',
       titleKey: 'admin.ops.title',
       descriptionKey: 'admin.ops.description'
+    }
+  },
+  // 运营管理（design.md 第二部分 v3.0）：前缀 opsmgmt，与上方可观测性 /admin/ops 隔离。
+  {
+    path: '/admin/opsmgmt',
+    redirect: '/admin/opsmgmt/dashboard'
+  },
+  {
+    path: '/admin/opsmgmt/dashboard',
+    name: 'AdminOpsMgmtDashboard',
+    component: () => import('@/views/admin/opsmgmt/DashboardView.vue'),
+    meta: {
+      requiresAuth: true,
+      requiresAdmin: true,
+      title: 'Ops Management Dashboard',
+      titleKey: 'admin.opsmgmt.dashboard.title',
+      descriptionKey: 'admin.opsmgmt.dashboard.description'
+    }
+  },
+  {
+    path: '/admin/opsmgmt/sites',
+    name: 'AdminOpsMgmtSites',
+    component: () => import('@/views/admin/opsmgmt/SitesView.vue'),
+    meta: {
+      requiresAuth: true,
+      requiresAdmin: true,
+      title: 'Upstream Sites',
+      titleKey: 'admin.opsmgmt.sites.title',
+      descriptionKey: 'admin.opsmgmt.sites.description'
+    }
+  },
+  {
+    path: '/admin/opsmgmt/expand',
+    name: 'AdminOpsMgmtExpand',
+    component: () => import('@/views/admin/opsmgmt/ExpandView.vue'),
+    meta: {
+      requiresAuth: true,
+      requiresAdmin: true,
+      title: 'Connect Channels',
+      titleKey: 'admin.opsmgmt.expand.title',
+      descriptionKey: 'admin.opsmgmt.expand.description'
+    }
+  },
+  {
+    path: '/admin/opsmgmt/profit',
+    name: 'AdminOpsMgmtProfit',
+    component: () => import('@/views/admin/opsmgmt/ProfitView.vue'),
+    meta: {
+      requiresAuth: true,
+      requiresAdmin: true,
+      title: 'Margin Management',
+      titleKey: 'admin.opsmgmt.profit.title',
+      descriptionKey: 'admin.opsmgmt.profit.description'
     }
   },
   {
@@ -570,6 +649,30 @@ const routes: RouteRecordRaw[] = [
       title: 'Announcements',
       titleKey: 'admin.announcements.title',
       descriptionKey: 'admin.announcements.description'
+    }
+  },
+  {
+    path: '/admin/tickets',
+    name: 'AdminTickets',
+    component: () => import('@/views/admin/TicketsView.vue'),
+    meta: {
+      requiresAuth: true,
+      requiresAdmin: true,
+      title: 'Ticket Management',
+      titleKey: 'admin.tickets.title',
+      descriptionKey: 'admin.tickets.description'
+    }
+  },
+  {
+    path: '/admin/model-pricing',
+    name: 'AdminModelPricing',
+    component: () => import('@/views/admin/ModelPricingView.vue'),
+    meta: {
+      requiresAuth: true,
+      requiresAdmin: true,
+      title: 'Model Pricing',
+      titleKey: 'admin.modelPricing.title',
+      descriptionKey: 'admin.modelPricing.description'
     }
   },
   {

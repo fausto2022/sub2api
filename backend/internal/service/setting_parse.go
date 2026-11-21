@@ -205,8 +205,8 @@ func (s *SettingService) InitializeDefaultSettings(ctx context.Context) error {
 		// Subscription feature (default enabled; opt-out)
 		SettingKeySubscriptionEnabled: "true",
 
-		// Model plaza feature (default disabled; opt-in, public unless require_auth)
-		SettingKeyModelPlazaEnabled:       "false",
+		// Model plaza feature (default enabled; opt-out, public unless require_auth)
+		SettingKeyModelPlazaEnabled:       "true",
 		SettingKeyModelPlazaRequireAuth:   "false",
 		SettingKeyModelPlazaDescription:   "",
 		SettingKeyPluginManagementEnabled: "false",
@@ -830,8 +830,8 @@ func (s *SettingService) parseSettings(settings map[string]string) *SystemSettin
 	// Subscription feature (default: enabled; only an explicit false disables)
 	result.SubscriptionEnabled = !isFalseSettingValue(settings[SettingKeySubscriptionEnabled])
 
-	// Model plaza feature (default: disabled; strict true)
-	result.ModelPlazaEnabled = settings[SettingKeyModelPlazaEnabled] == "true"
+	// Model plaza feature (default: enabled, opt-out; strict true only for require_auth)
+	result.ModelPlazaEnabled = modelPlazaEnabledFromSetting(settings[SettingKeyModelPlazaEnabled])
 	result.ModelPlazaRequireAuth = settings[SettingKeyModelPlazaRequireAuth] == "true"
 	result.ModelPlazaDescription = settings[SettingKeyModelPlazaDescription]
 	result.PluginManagementEnabled = settings[SettingKeyPluginManagementEnabled] == "true"
@@ -1038,6 +1038,15 @@ func isTrueSettingValue(value string) bool {
 	default:
 		return false
 	}
+}
+
+// modelPlazaEnabledFromSetting 解析 model_plaza_enabled 开关。
+//
+// 模型广场默认对所有人开放（design.md §0.6），因此缺失/空值视为开启；只有显式写入
+// false/0/off/disabled 才关闭。所有读取该开关的位置（公开设置、管理端视图、
+// GetModelPlazaRuntime）必须走这里，避免各处的 `== "true"` 又把默认值拉回关闭。
+func modelPlazaEnabledFromSetting(value string) bool {
+	return !isFalseSettingValue(value)
 }
 
 func normalizeVisibleMethodSettingSource(method, source string, enabled bool) (string, error) {

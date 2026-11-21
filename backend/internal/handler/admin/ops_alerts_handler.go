@@ -20,6 +20,8 @@ var validOpsAlertMetricTypes = []string{
 	"success_rate",
 	"error_rate",
 	"upstream_error_rate",
+	service.OpsFailoverSwitchRatioMetric,
+	service.OpsFailoverExhaustedRatioMetric,
 	"cpu_usage_percent",
 	"memory_usage_percent",
 	"concurrency_queue_depth",
@@ -95,7 +97,9 @@ func isPercentOrRateMetric(metricType string) bool {
 		"memory_usage_percent",
 		"group_available_ratio",
 		"group_rate_limit_ratio",
-		"account_error_ratio":
+		"account_error_ratio",
+		service.OpsFailoverSwitchRatioMetric,
+		service.OpsFailoverExhaustedRatioMetric:
 		return true
 	default:
 		return false

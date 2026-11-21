@@ -1156,6 +1156,16 @@ pricing:
   # 未配置时使用内置官方价（先按已发布型号，再按 Pro / Flash 系列兜底）；两者都没有的模型拒绝创建缓存。
   # 目录中不存在的模型条目还须同时提供 input_cost_per_token / output_cost_per_token。
   # override_file: "./data/model_pricing_overrides.json"
+  # CNY billing layer (optional): per-model native CNY prices (CNY / 1M tokens),
+  # applied before the USD override file. convert mode divides by cny_per_usd
+  # (default 7.14); direct mode uses ¥1 = $1. When empty the path is derived as
+  # cny-overrides.json next to override_file, else under data_dir. Edits are
+  # detected by content hash at the next hash check and reloaded without restart.
+  # 人民币计费口径层（可选）：逐模型人民币原生价（CNY / 百万 tokens），先于 USD override
+  # 换算叠加。convert 模式按 cny_per_usd（默认 7.14）折算；direct 模式 ¥1 = $1。
+  # 留空时按 override_file 同目录推导 cny-overrides.json，否则落在 data_dir 下。
+  # 修改后在下一次哈希检查时按内容哈希自动重载，无需重启。
+  # cny_override_file: "./data/cny-overrides.json"
   # Update interval in hours
   # 更新间隔（小时）
   update_interval_hours: 24

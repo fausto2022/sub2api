@@ -1284,6 +1284,7 @@ func OpsErrorLoggerMiddleware(ops *service.OpsService) gin.HandlerFunc {
 			entry.ClientIP = &clientIP
 		}
 
+		attachOpsFailoverTelemetry(c, entry)
 		enqueueOpsErrorLog(ops, entry)
 	}
 }
@@ -1295,11 +1296,14 @@ func logOpsRecoveredUpstream(c *gin.Context, ops *service.OpsService, finalStatu
 
 	entry := &service.OpsInsertErrorLogInput{StatusCode: finalStatus}
 	applyOpsUpstreamFieldsFromContext(c, entry)
+	legacyHidden := c.GetBool(service.OpsSkipPassthroughKey)
 	if len(entry.UpstreamErrors) > 0 {
 		visibleEvents := make([]*service.OpsUpstreamErrorEvent, 0, len(entry.UpstreamErrors))
 		for _, event := range entry.UpstreamErrors {
 			if event != nil && !event.SkipMonitoring {
 				visibleEvents = append(visibleEvents, event)
+			} else if event != nil {
+				legacyHidden = true
 			}
 		}
 		if len(visibleEvents) == 0 {
@@ -1309,6 +1313,10 @@ func logOpsRecoveredUpstream(c *gin.Context, ops *service.OpsService, finalStatu
 	}
 	if entry.UpstreamStatusCode == nil && entry.UpstreamErrorMessage == nil &&
 		entry.UpstreamErrorDetail == nil && len(entry.UpstreamErrors) == 0 {
+		if telemetry := recoveredFailoverTelemetryEntry(c, finalStatus); telemetry != nil {
+			c.Set(opsRecoveredFailoverEnqueuedKey, true)
+			enqueueOpsErrorLog(ops, telemetry)
+		}
 		return
 	}
 
@@ -1400,6 +1408,9 @@ func logOpsRecoveredUpstream(c *gin.Context, ops *service.OpsService, finalStatu
 		entry.ClientIP = &clientIP
 	}
 	applyOpsLatencyFieldsFromContext(c, entry)
+	if !legacyHidden {
+		attachOpsFailoverTelemetry(c, entry)
+	}
 	enqueueOpsErrorLog(ops, entry)
 }
 
@@ -1589,6 +1600,7 @@ func logOpsStreamErrorValue(c *gin.Context, ops *service.OpsService, wireStatus 
 		entry.ClientIP = &clientIP
 	}
 
+	attachOpsFailoverTelemetry(c, entry)
 	enqueueOpsErrorLog(ops, entry)
 }
 

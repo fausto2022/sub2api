@@ -2013,8 +2013,15 @@ func persistOpenAI429PlanType(ctx context.Context, repo AccountRepository, accou
 	slog.Info("openai_429_plan_type_synced", "account_id", account.ID, "previous_plan_type", current, "plan_type", planType)
 }
 
-// handle529 处理529过载错误
-// 根据配置决定是否暂停账号调度及冷却时长
+// A short debounce window collapses a burst of 529 writes while preserving
+// subsequent extensions to the configured overload deadline.
+const overloadWriteDebounceWindow = time.Second
+
+type overloadWriteDebouncer interface {
+	TryAcquireOverloadWrite(ctx context.Context, accountID int64, window time.Duration) (bool, func(context.Context) error, error)
+}
+
+// handle529 applies the existing configured overload cooldown.
 func (s *RateLimitService) handle529(ctx context.Context, account *Account) {
 	var settings *OverloadCooldownSettings
 	if s.settingService != nil {
@@ -2046,7 +2053,33 @@ func (s *RateLimitService) handle529(ctx context.Context, account *Account) {
 
 	until := time.Now().Add(time.Duration(cooldownMinutes) * time.Minute)
 	s.notifyAccountSchedulingBlocked(account, until, "529")
+
+	// The production temp-unsched cache supplies the optional distributed gate.
+	// A missing or unavailable cache leaves the existing write path available.
+	var release func(context.Context) error
+	redisTimeout := 500 * time.Millisecond
+	if s.cfg != nil && s.cfg.Gateway.FailoverPolicy.Cooldown.RedisTimeout > 0 {
+		redisTimeout = s.cfg.Gateway.FailoverPolicy.Cooldown.RedisTimeout
+	}
+	if cache, ok := s.tempUnschedCache.(overloadWriteDebouncer); ok {
+		cacheCtx, cancel := context.WithTimeout(ctx, redisTimeout)
+		acquired, releaseWrite, err := cache.TryAcquireOverloadWrite(cacheCtx, account.ID, overloadWriteDebounceWindow)
+		cancel()
+		if err == nil {
+			if !acquired {
+				return
+			}
+			release = releaseWrite
+		}
+	}
 	if err := s.accountRepo.SetOverloaded(ctx, account.ID, until); err != nil {
+		if release != nil {
+			// Permit the next observation to retry a failed DB write, even if
+			// this request was canceled while persisting it.
+			releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), redisTimeout)
+			_ = release(releaseCtx)
+			cancel()
+		}
 		slog.Warn("overload_set_failed", "account_id", account.ID, "error", err)
 		return
 	}
@@ -2861,9 +2894,23 @@ func (s *RateLimitService) triggerTempUnschedulable(ctx context.Context, account
 		reason = strings.TrimSpace(state.ErrorMessage)
 	}
 
+	scope := "account"
+	if modelScoped {
+		scope = "model:" + modelKey
+	}
+	if DeferFailoverMutation(ctx, account.ID, scope, func(writeCtx context.Context) {
+		s.persistTempUnschedulable(writeCtx, account, state, reason, until, rule, ruleIndex)
+	}) {
+		return true
+	}
+	return s.persistTempUnschedulable(ctx, account, state, reason, until, rule, ruleIndex)
+}
+
+func (s *RateLimitService) persistTempUnschedulable(ctx context.Context, account *Account, state *TempUnschedState, reason string, until time.Time, rule TempUnschedulableRule, ruleIndex int) bool {
+	statusCode, modelKey := state.StatusCode, state.Model
 	// Persist model-scoped hits under the model key so the scheduler excludes
 	// only this (account, model) pair; every other hit pauses the whole account below.
-	if modelScoped {
+	if state.Scope == TempUnschedScopeModel {
 		if err := s.accountRepo.SetModelRateLimit(ctx, account.ID, modelKey, until, reason); err != nil {
 			slog.Warn("temp_unsched_model_rate_limit_set_failed", "account_id", account.ID, "model", modelKey, "error", err)
 			// The rule matched, so fail over the current request even if persistence

@@ -1,5 +1,5 @@
 <template>
-  <div class="mx-auto min-w-0 max-w-7xl space-y-4">
+  <div class="mx-auto min-w-0 max-w-[72rem] space-y-6">
     <header v-if="!embedded || !authenticated" class="flex flex-wrap items-end justify-between gap-x-4 gap-y-2">
       <div v-if="!embedded">
         <h1 class="text-2xl font-bold tracking-tight text-accent-900 dark:text-dark-50">{{ t('modelPlaza.title') }}</h1>
@@ -35,46 +35,39 @@
         v-html="descriptionHtml"
       ></div>
       <PlazaFilterBar
-        v-if="catalog.groups.length"
-        v-model:type="selectedType"
+        :active-provider="selectedProvider"
+        :providers="catalog.providers"
+        :groups="groups"
         v-model:group-id="selectedGroupId"
         v-model:search="searchQuery"
-        :types="catalog.types"
-        :groups="catalog.groups"
-      />
-
-      <div
-        v-if="!catalog.types.length || results.noMatch"
-        class="rounded-xl border border-dashed border-accent-300 px-4 py-6 text-center text-sm text-accent-600 dark:border-dark-600 dark:text-dark-300"
+        @update:provider="selectProvider"
       >
-        <p role="status">{{ t(results.noMatch ? 'modelPlaza.noSearchResult' : 'modelPlaza.empty') }}</p>
-        <button v-if="results.noMatch" type="button" class="btn-secondary mt-3 min-h-11" @click="clearFilters">
-          {{ t('modelPlaza.clearFilters') }}
-        </button>
-      </div>
-
-      <div v-if="results.sections.length" class="space-y-7">
-        <section v-for="section in results.sections" :key="section.type" class="min-w-0 space-y-3">
-          <h2 class="border-l-2 border-primary-500 pl-2.5 text-xl font-semibold text-accent-900 dark:border-primary-400 dark:text-dark-50">
-            {{ t(`modelPlaza.types.${section.type}`) }}
-          </h2>
-          <PlazaGroupSection
-            v-for="entry in section.groups"
-            :key="entry.group.id"
-            :group="entry.group"
-            :models="entry.models"
-          />
-        </section>
-      </div>
-
-      <section v-if="results.emptyGroups.length" class="space-y-3">
-        <h2 class="border-l-2 border-accent-300 pl-2.5 text-lg font-semibold text-accent-900 dark:border-dark-600 dark:text-dark-50">
-          {{ t('modelPlaza.emptyGroups') }}
-        </h2>
-        <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
-          <PlazaGroupSection v-for="group in results.emptyGroups" :key="group.id" :group="group" :models="[]" />
+        <div
+          v-if="!catalog.providers.length || results.noMatch"
+          class="rounded-xl border border-dashed border-accent-300 px-4 py-6 text-center text-sm text-accent-600 dark:border-dark-600 dark:text-dark-300"
+        >
+          <p role="status">{{ t(results.noMatch ? 'modelPlaza.noSearchResult' : 'modelPlaza.empty') }}</p>
+          <button v-if="results.noMatch" type="button" class="btn-secondary mt-3 min-h-11" @click="searchQuery = ''">
+            {{ t('modelPlaza.clearSearch') }}
+          </button>
         </div>
-      </section>
+
+        <PlazaGroupSection
+          v-for="entry in results.entries"
+          :key="entry.group.id"
+          :group="entry.group"
+          :models="entry.models"
+        />
+
+        <section v-if="results.emptyGroups.length" class="space-y-3">
+          <h2 class="text-sm font-semibold text-accent-700 dark:text-dark-200">
+            {{ t('modelPlaza.emptyGroups') }}
+          </h2>
+          <div class="overflow-hidden rounded-xl border border-accent-200 bg-white dark:border-dark-700 dark:bg-dark-800">
+            <PlazaGroupSection v-for="group in results.emptyGroups" :key="group.id" :group="group" :models="[]" />
+          </div>
+        </section>
+      </PlazaFilterBar>
     </template>
   </div>
 </template>
@@ -88,7 +81,8 @@ import Icon from '@/components/icons/Icon.vue'
 import PlazaFilterBar from './PlazaFilterBar.vue'
 import PlazaGroupSection from './PlazaGroupSection.vue'
 import type { ModelPlazaResponse } from '@/api/modelPlaza'
-import { buildPlazaCatalog, filterPlazaCatalog, type PlazaGroupFilter, type PlazaTypeFilter } from './catalog'
+import type { KeyGroupProvider } from '@/utils/keyGroupProviders'
+import { buildPlazaCatalog, filterPlazaCatalog, resolvePlazaSelection, type PlazaGroupFilter } from './catalog'
 
 const props = defineProps<{
   response: ModelPlazaResponse | null
@@ -101,27 +95,25 @@ const props = defineProps<{
 defineEmits<{ retry: [] }>()
 
 const { t } = useI18n()
-const selectedType = ref<PlazaTypeFilter>('all')
+const selectedProvider = ref<KeyGroupProvider | null>(null)
 const selectedGroupId = ref<PlazaGroupFilter>('all')
 const searchQuery = ref('')
 
-function clearFilters() {
-  selectedType.value = 'all'
+const catalog = computed(() => buildPlazaCatalog(props.response?.groups ?? []))
+const groups = computed(() => selectedProvider.value ? catalog.value.groupsByProvider.get(selectedProvider.value) ?? [] : [])
+const results = computed(() => filterPlazaCatalog(groups.value, selectedGroupId.value, searchQuery.value))
+
+function selectProvider(provider: KeyGroupProvider) {
+  if (provider === selectedProvider.value || !catalog.value.groupsByProvider.has(provider)) return
+  selectedProvider.value = provider
   selectedGroupId.value = 'all'
-  searchQuery.value = ''
 }
 
-const catalog = computed(() => buildPlazaCatalog(props.response?.groups ?? []))
-const results = computed(() =>
-  filterPlazaCatalog(catalog.value, selectedType.value, selectedGroupId.value, searchQuery.value)
-)
-
-watch(catalog, ({ groups, types }) => {
-  if (selectedType.value !== 'all' && !types.includes(selectedType.value)) selectedType.value = 'all'
-  if (selectedGroupId.value !== 'all' && !groups.some(group => group.id === selectedGroupId.value)) {
-    selectedGroupId.value = 'all'
-  }
-})
+watch(catalog, (nextCatalog) => {
+  const { provider, groupId } = resolvePlazaSelection(nextCatalog, selectedProvider.value, selectedGroupId.value)
+  selectedProvider.value = provider
+  selectedGroupId.value = groupId
+}, { immediate: true })
 
 const descriptionHtml = computed(() => {
   const markdown = props.response?.description?.trim()

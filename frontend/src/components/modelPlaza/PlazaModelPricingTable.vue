@@ -1,106 +1,70 @@
 <template>
   <div
-    class="plaza-pricing-table overflow-x-auto"
-    :style="accentStyle"
+    class="plaza-pricing-table max-w-full overflow-x-auto"
     role="region"
     :aria-label="t('modelPlaza.title')"
     tabindex="0"
   >
-    <table class="w-full min-w-[1000px] table-auto border-collapse text-sm tabular-nums">
+    <table role="table" class="w-full min-w-[832px] table-auto border-collapse text-sm tabular-nums">
       <colgroup>
-        <col :class="showCatalogColumn ? 'w-[19%]' : 'w-[25%]'" />
-        <!-- 目录价列：组内无模型纳入目录价时不渲染（design.md §4.3） -->
-        <col v-if="showCatalogColumn" class="w-[11%]" />
-        <col class="w-[11%]" />
-        <col class="w-[9%]" />
+        <col class="w-[22%]" />
+        <col class="w-[12%]" />
+        <col class="w-[12%]" />
+        <col class="w-[16%]" />
+        <col class="w-[12%]" />
+        <col class="w-[12%]" />
         <col class="w-[14%]" />
-        <col class="w-[11%]" />
-        <col class="w-[8%]" />
-        <col class="w-[14%]" />
-        <!-- 峰时价列：组内无模型启用峰谷时不渲染 -->
-        <col v-if="showPeakColumn" class="w-[12%]" />
-        <col class="w-[8%]" />
       </colgroup>
-      <thead>
+      <thead role="rowgroup">
         <tr
+          role="row"
           class="text-xs font-semibold uppercase tracking-wider text-gray-500 dark:text-dark-400"
         >
-          <th
+          <th role="columnheader"
             rowspan="2"
             class="border-r border-gray-100 py-2.5 pl-5 pr-4 text-left align-middle dark:border-dark-700/60"
           >
             {{ t('modelPlaza.table.model') }}
           </th>
-          <!-- 目录价（未乘倍率）：后端 catalog_pricing 为 null 的模型显示 - -->
-          <th
-            v-if="showCatalogColumn"
-            rowspan="2"
-            class="border-r border-gray-100 py-2.5 pl-3 pr-3 text-left align-middle dark:border-dark-700/60"
-            :title="t('modelPlaza.table.catalogPriceHint')"
-          >
-            <div>{{ t('modelPlaza.table.catalogPrice') }}</div>
-            <div class="mt-0.5 normal-case font-normal text-gray-400 dark:text-dark-500">
-              {{ t('modelPlaza.table.unitPerMillion') }}
-            </div>
-          </th>
-          <th colspan="3" class="pz-bg pt-2 text-center">
-            <div
-              class="pz-title border-b pb-2 font-semibold"
-              :title="t('modelPlaza.table.discountedPriceHint')"
-            >
+          <th role="columnheader" colspan="3" class="pz-bg pt-2 text-center">
+            <div class="pz-title border-b pb-2 font-semibold">
               {{ t('modelPlaza.table.discountedPrice') }}
               <span class="pz-unit ml-1 normal-case font-normal">{{ t('modelPlaza.table.unitPerMillion') }}</span>
             </div>
           </th>
-          <th
+          <th role="columnheader"
             colspan="3"
             class="border-l border-gray-100 pt-2 text-center dark:border-dark-700/60"
           >
-            <div class="border-b border-gray-200 pb-2 text-gray-400 dark:border-dark-600 dark:text-dark-500">
+            <div class="border-b border-gray-200 pb-2 text-accent-600 dark:border-dark-600 dark:text-dark-300">
               {{ t('modelPlaza.table.officialPrice') }}
-              <span class="ml-1 normal-case font-normal text-gray-400 dark:text-dark-500">{{ t('modelPlaza.table.unitPerMillion') }}</span>
+              <span class="ml-1 normal-case font-normal">{{ t('modelPlaza.table.unitPerMillion') }}</span>
             </div>
-          </th>
-          <!-- 峰时价：未乘倍率的模型级峰价按生效倍率折算 -->
-          <th
-            v-if="showPeakColumn"
-            rowspan="2"
-            class="border-l border-gray-100 py-2.5 pl-3 pr-3 text-left align-middle dark:border-dark-700/60"
-            :title="t('modelPlaza.table.peakPriceHint')"
-          >
-            <div>{{ t('modelPlaza.table.peakPrice') }}</div>
-            <div class="mt-0.5 normal-case font-normal text-gray-400 dark:text-dark-500">
-              {{ t('modelPlaza.table.unitPerMillion') }}
-            </div>
-          </th>
-          <th
-            rowspan="2"
-            class="border-l border-gray-100 py-2.5 pl-3 pr-5 text-right align-middle dark:border-dark-700/60"
-          >
-            {{ t('modelPlaza.table.rate') }}
           </th>
         </tr>
         <tr
+          role="row"
           class="border-b border-gray-200 text-left text-[11px] font-medium uppercase leading-4 tracking-wide text-gray-400 dark:border-dark-700 dark:text-dark-500"
         >
-          <th class="pz-bg px-3 py-2 font-medium">{{ t('modelPlaza.table.input') }}</th>
-          <th class="pz-bg px-3 py-2 font-medium">{{ t('modelPlaza.table.output') }}</th>
-          <th class="pz-bg px-3 py-2 font-medium">{{ t('modelPlaza.table.cache') }}</th>
-          <th class="border-l border-gray-100 px-3 py-2 font-medium dark:border-dark-700/60">
+          <th role="columnheader" class="pz-bg px-3 py-2 font-medium">{{ t('modelPlaza.table.input') }}</th>
+          <th role="columnheader" class="pz-bg px-3 py-2 font-medium">{{ t('modelPlaza.table.output') }}</th>
+          <th role="columnheader" class="pz-bg px-3 py-2 font-medium">{{ t('modelPlaza.table.cache') }}</th>
+          <th role="columnheader" class="border-l border-gray-100 px-3 py-2 font-medium dark:border-dark-700/60">
             {{ t('modelPlaza.table.input') }}
           </th>
-          <th class="px-3 py-2 font-medium">{{ t('modelPlaza.table.output') }}</th>
-          <th class="px-3 py-2 font-medium">{{ t('modelPlaza.table.cache') }}</th>
+          <th role="columnheader" class="px-3 py-2 font-medium">{{ t('modelPlaza.table.output') }}</th>
+          <th role="columnheader" class="px-3 py-2 font-medium">{{ t('modelPlaza.table.cache') }}</th>
         </tr>
       </thead>
-      <tbody>
+      <tbody role="rowgroup">
         <tr
           v-for="{ model: m, period, key } in rows"
           :key="key"
+          role="row"
           class="border-b border-gray-100 transition-colors last:border-b-0 hover:bg-gray-50/70 dark:border-dark-800 dark:hover:bg-dark-800/50"
         >
           <!-- 模型名 + 非 token 计费模式徽章;分时时段行额外标注时段 -->
-          <td class="border-r border-gray-100 py-2.5 pl-5 pr-4 align-middle dark:border-dark-700/60">
+          <td role="cell" class="pz-model border-r border-gray-100 py-2.5 pl-5 pr-4 align-top dark:border-dark-700/60">
             <div class="flex flex-wrap items-center gap-1.5">
               <span class="font-medium text-gray-900 dark:text-white">{{ m.name }}</span>
               <!-- 时段徽章紧跟模型名,其余徽章排在后面,空间不足时先换行的是它们 -->
@@ -148,30 +112,10 @@
             </div>
           </td>
 
-          <!-- 目录价（未乘倍率）：catalog_pricing 为 null 显示 -，表示该模型未纳入目录价 -->
-          <td
-            v-if="showCatalogColumn"
-            class="pz-catalog border-r border-gray-100 px-3 py-2.5 align-middle font-mono text-xs text-gray-500 dark:border-dark-700/60 dark:text-dark-400"
-          >
-            <template v-if="catalogIntervals(m).length">
-              <div
-                v-for="(iv, idx) in catalogIntervals(m)"
-                :key="idx"
-                class="whitespace-nowrap leading-5"
-              >
-                <span class="mr-1 font-sans text-gray-400 dark:text-dark-500" :title="tierHint(m)">{{ tierLabel(iv) }}</span>
-                {{ catalogPrice(iv.input_price) }} / {{ catalogPrice(iv.output_price) }}
-              </div>
-            </template>
-            <template v-else-if="m.catalog_pricing">
-              {{ catalogPrice(m.catalog_pricing.input_price) }} / {{ catalogPrice(m.catalog_pricing.output_price) }}
-            </template>
-            <span v-else class="text-gray-400 dark:text-dark-500">-</span>
-          </td>
-
           <!-- token 计费:输入 / 输出 / 缓存(写/读),有阶梯时每档一行;档位标签只放输入列,其余列按行对齐 -->
           <template v-if="billingMode(m) === BILLING_MODE_TOKEN">
-            <td class="pz-cell px-3 py-2.5 align-middle font-mono font-semibold text-gray-900 dark:text-gray-50">
+            <td role="cell" class="pz-cell pz-compact-core px-3 py-2.5 align-top font-mono font-semibold text-gray-900 dark:text-gray-50">
+              <span class="pz-compact-label" aria-hidden="true" :data-label="compactTokenLabel('discountedPrice')" />
               <template v-if="tokenIntervals(m).length">
                 <div
                   v-for="(iv, idx) in tokenIntervals(m)"
@@ -184,7 +128,8 @@
               </template>
               <template v-else>{{ paidPerMillion(m, 'input_price', period) }}</template>
             </td>
-            <td class="pz-cell px-3 py-2.5 align-middle font-mono font-semibold text-gray-900 dark:text-gray-50">
+            <td role="cell" class="pz-cell pz-compact-core px-3 py-2.5 align-top font-mono font-semibold text-gray-900 dark:text-gray-50">
+              <span class="pz-compact-label" aria-hidden="true" :data-label="t('modelPlaza.table.output')" />
               <template v-if="tokenIntervals(m).length">
                 <div
                   v-for="(iv, idx) in tokenIntervals(m)"
@@ -197,7 +142,14 @@
               </template>
               <template v-else>{{ paidPerMillion(m, 'output_price', period) }}</template>
             </td>
-            <td class="pz-cell px-3 py-2.5 align-middle">
+          </template>
+          <td
+            role="cell"
+            :colspan="billingMode(m) === BILLING_MODE_TOKEN ? undefined : 3"
+            class="pz-cell pz-discounted-detail px-3 py-2.5 align-top"
+          >
+            <template v-if="billingMode(m) === BILLING_MODE_TOKEN">
+              <span class="pz-compact-label" aria-hidden="true" :data-label="t('modelPlaza.table.cache')" />
               <template v-if="hasTierCachePricing(tokenIntervals(m))">
                 <div
                   v-for="(iv, idx) in tokenIntervals(m)"
@@ -242,12 +194,9 @@
                 </div>
               </div>
               <span v-else class="text-gray-400 dark:text-dark-500">-</span>
-            </td>
-          </template>
-
-          <!-- 按次 / 按图片计费:实付区整体合并,阶梯芯片或单一按次价 -->
-          <template v-else>
-            <td colspan="3" class="pz-cell px-3 py-2.5 align-middle">
+            </template>
+            <template v-else>
+              <span class="pz-compact-label" aria-hidden="true" :data-label="t('modelPlaza.table.discountedPrice')" />
               <div
                 v-if="requestIntervals(m).length"
                 class="flex flex-wrap items-center gap-1.5"
@@ -269,13 +218,43 @@
                 <span class="ml-1 text-xs text-gray-400 dark:text-dark-500">{{ perUnitSuffix(m) }}</span>
               </template>
               <span v-else class="text-gray-400 dark:text-dark-500">-</span>
-            </td>
-          </template>
+            </template>
+
+            <div
+              v-if="!period && m.peak_pricing && (m.peak_pricing.input_price != null || m.peak_pricing.output_price != null)"
+              class="pz-peak mt-2 text-xs text-amber-700 dark:text-amber-300"
+              :title="t('modelPlaza.table.peakPriceHint')"
+            >
+              {{ t('modelPlaza.table.peakPrice') }}
+              <span class="block text-accent-600 dark:text-dark-300">{{ t('modelPlaza.table.pricePair') }}</span>
+              <span class="font-mono">
+                {{ peakPrice(m.peak_pricing.input_price) }} / {{ peakPrice(m.peak_pricing.output_price) }}
+              </span>
+            </div>
+            <div class="pz-rate mt-2 text-xs text-accent-600 dark:text-dark-300">
+              {{ t('modelPlaza.table.rate') }}
+              <span class="font-mono">
+                <span
+                  v-if="period"
+                  class="font-semibold text-primary-700 dark:text-primary-300"
+                  :title="t('modelPlaza.table.timePricingRateHint', { rate: effectiveRate, multiplier: period.multiplier })"
+                >{{ periodRate(period) }}x</span>
+                <span v-else-if="usesIndependentMediaRate(m)" class="font-semibold">{{ requestRate(m) }}x</span>
+                <template v-else-if="hasCustomRate">
+                  <span class="mr-1 line-through">{{ rateMultiplier }}x</span>
+                  <span class="font-semibold text-primary-700 dark:text-primary-300">{{ effectiveRate }}x</span>
+                </template>
+                <span v-else class="font-semibold">{{ effectiveRate }}x</span>
+              </span>
+            </div>
+          </td>
 
           <!-- 官方价格(参考价,不乘倍率;官方有阶梯时每档一行) -->
           <td
-            class="border-l border-gray-100 px-3 py-2.5 align-middle font-mono text-xs text-gray-500 dark:border-dark-700/60 dark:text-dark-400"
+            role="cell"
+            class="pz-compact-core border-l border-gray-100 px-3 py-2.5 align-top font-mono text-xs text-accent-600 dark:border-dark-700/60 dark:text-dark-300"
           >
+            <span class="pz-compact-label" aria-hidden="true" :data-label="compactTokenLabel('officialPrice')" />
             <template v-if="officialIntervals(m).length">
               <div
                 v-for="(iv, idx) in officialIntervals(m)"
@@ -288,7 +267,8 @@
             </template>
             <template v-else>{{ official(m.official_pricing?.input_price) }}</template>
           </td>
-          <td class="px-3 py-2.5 align-middle font-mono text-xs text-gray-500 dark:text-dark-400">
+          <td role="cell" class="pz-compact-core px-3 py-2.5 align-top font-mono text-xs text-accent-600 dark:text-dark-300">
+            <span class="pz-compact-label" aria-hidden="true" :data-label="t('modelPlaza.table.output')" />
             <template v-if="officialIntervals(m).length">
               <div
                 v-for="(iv, idx) in officialIntervals(m)"
@@ -301,7 +281,8 @@
             </template>
             <template v-else>{{ official(m.official_pricing?.output_price) }}</template>
           </td>
-          <td class="px-3 py-2.5 align-middle">
+          <td role="cell" class="pz-official-cache px-3 py-2.5 align-top">
+            <span class="pz-compact-label" aria-hidden="true" :data-label="t('modelPlaza.table.cache')" />
             <template v-if="hasTierCachePricing(officialIntervals(m))">
               <div
                 v-for="(iv, idx) in officialIntervals(m)"
@@ -348,42 +329,6 @@
             <span v-else class="text-gray-400 dark:text-dark-500">-</span>
           </td>
 
-          <!-- 峰时价：模型级峰价比生效倍率折算，便于与折后价同口径对照 -->
-          <td
-            v-if="showPeakColumn"
-            class="border-l border-gray-100 px-3 py-2.5 align-middle font-mono text-xs dark:border-dark-700/60"
-          >
-            <template v-if="m.peak_pricing">
-              <div class="whitespace-nowrap text-amber-700 dark:text-amber-300">
-                {{ peakPrice(m.peak_pricing.input_price) }}
-                <span class="mx-0.5 font-sans text-gray-400 dark:text-dark-500">/</span>
-                {{ peakPrice(m.peak_pricing.output_price) }}
-              </div>
-            </template>
-            <span v-else class="text-gray-400 dark:text-dark-500">-</span>
-          </td>
-
-          <!-- 折扣倍率(分时时段行展示 生效倍率×时段倍率;生图独立倍率行展示独立倍率;专属倍率划线展示原倍率) -->
-          <td
-            class="border-l border-gray-100 py-2.5 pl-3 pr-5 text-right align-middle font-mono text-xs dark:border-dark-700/60"
-          >
-            <span
-              v-if="period"
-              class="font-bold text-primary-600 dark:text-primary-400"
-              :title="t('modelPlaza.table.timePricingRateHint', { rate: effectiveRate, multiplier: period.multiplier })"
-              >{{ periodRate(period) }}x</span
-            >
-            <span
-              v-else-if="usesIndependentMediaRate(m)"
-              class="font-bold text-gray-700 dark:text-gray-300"
-              >{{ requestRate(m) }}x</span
-            >
-            <template v-else-if="hasCustomRate">
-              <span class="mr-1 text-gray-400 line-through dark:text-dark-500">{{ rateMultiplier }}x</span>
-              <span class="font-bold text-primary-600 dark:text-primary-400">{{ effectiveRate }}x</span>
-            </template>
-            <span v-else class="font-bold text-gray-700 dark:text-gray-300">{{ effectiveRate }}x</span>
-          </td>
         </tr>
       </tbody>
     </table>
@@ -394,7 +339,7 @@
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { formatScaled, resolveIntervalPrices, scalePricing } from '@/utils/pricing'
-import { platformAccentColor, platformBadgeLightClass, platformLabel } from '@/utils/platformColors'
+import { platformBadgeLightClass, platformLabel } from '@/utils/platformColors'
 import {
   BILLING_MODE_TOKEN,
   BILLING_MODE_IMAGE,
@@ -440,8 +385,13 @@ const props = defineProps<{
 
 const { t } = useI18n()
 
-/** 实付分区只从平台拿一个主色,浅底/标题/下划线全部由 scoped CSS 用 color-mix 派生。 */
-const accentStyle = computed(() => ({ '--plaza-accent': platformAccentColor(props.platform ?? '') }))
+function compactTokenLabel(family: 'discountedPrice' | 'officialPrice'): string {
+  return [
+    t(`modelPlaza.table.${family}`),
+    t('modelPlaza.table.unitPerMillion'),
+    t('modelPlaza.table.input')
+  ].join('\n')
+}
 
 const PER_MILLION = 1_000_000
 
@@ -469,15 +419,6 @@ const effectiveRate = computed(() => props.userRateMultiplier ?? props.rateMulti
 const hasCustomRate = computed(
   () => props.userRateMultiplier != null && props.userRateMultiplier !== props.rateMultiplier
 )
-
-/**
- * 目录价列：分组内至少一个模型被目录价层接管时才渲染（design.md §4.3）。
- * catalog_pricing 为 null 的模型在该列显示 «-»。
- */
-const showCatalogColumn = computed(() => props.models.some((m) => m.catalog_pricing != null))
-
-/** 峰时价列：分组内至少一个模型启用模型级峰谷时才渲染，否则整列隐藏。 */
-const showPeakColumn = computed(() => props.models.some((m) => m.peak_pricing != null))
 
 function billingMode(m: PlazaModel): BillingMode {
   return (m.pricing?.billing_mode || BILLING_MODE_TOKEN) as BillingMode
@@ -547,15 +488,9 @@ function discounted(m: PlazaModel): UserSupportedModelPricing | null {
   return displayPricing.value.get(modelKey(m)) ?? null
 }
 
-/** 目录价原值（未乘倍率），按 $/1M token 展示。 */
-function catalogPrice(value: number | null | undefined): string {
-  if (value == null) return '-'
-  return formatScaled(value, PER_MILLION, MIN_DECIMALS)
-}
-
 /**
  * 峰时价按生效倍率折算后展示：峰价是模型级绝对价（未乘倍率），
- * 折算后与折后价同口径，便于与目录价/折后价直接对照。
+ * 折算后作为折后价的详情，不再独立成列。
  */
 function peakPrice(value: number | null | undefined): string {
   if (value == null) return '-'
@@ -709,11 +644,6 @@ function officialIntervals(m: PlazaModel): UserPricingInterval[] {
   return sortByContext(m.official_pricing?.intervals ?? [])
 }
 
-/** 目录价阶梯：目录价带多档时逐档展示，未下发 catalog_pricing 的模型为空。 */
-function catalogIntervals(m: PlazaModel): UserPricingInterval[] {
-  return sortByContext(m.catalog_pricing?.intervals ?? [])
-}
-
 /** 任一档带缓存价才按档渲染缓存列;否则沿用平价的写入/读取两行。 */
 function hasTierCachePricing(intervals: UserPricingInterval[]): boolean {
   return intervals.some((iv) =>
@@ -757,72 +687,94 @@ function trimZero(n: number): string {
 </script>
 
 <style scoped>
-/* 实付分区配色统一从 --plaza-accent(平台主色)派生,新增平台无需扩展样式 */
-.plaza-pricing-table {
-  --pz-title: color-mix(in srgb, var(--plaza-accent) 88%, black);
-  --pz-bg: color-mix(in srgb, var(--plaza-accent) 7%, transparent);
-  --pz-bg-hover: color-mix(in srgb, var(--plaza-accent) 13%, transparent);
-}
-
-.dark .plaza-pricing-table {
-  --pz-title: color-mix(in srgb, var(--plaza-accent) 70%, white);
-  --pz-bg: color-mix(in srgb, var(--plaza-accent) 6%, transparent);
-  --pz-bg-hover: color-mix(in srgb, var(--plaza-accent) 10%, transparent);
-}
-
-.pz-bg,
-.pz-cell {
-  background-color: var(--pz-bg);
+/* Keep the effective price prominent across every provider. */
+.pz-bg {
+  @apply bg-primary-50 dark:bg-primary-900/25;
 }
 
 .pz-cell {
-  transition: background-color 150ms cubic-bezier(0.4, 0, 0.2, 1);
+  @apply bg-primary-50/50 transition-colors motion-reduce:transition-none dark:bg-primary-900/10;
 }
 
 tbody tr:hover .pz-cell {
-  background-color: var(--pz-bg-hover);
+  @apply bg-primary-50 dark:bg-primary-900/25;
 }
 
 .pz-title {
-  /* color-mix 不可用的老浏览器回退为平台原色 */
-  color: var(--plaza-accent);
-  color: var(--pz-title);
-  border-color: color-mix(in srgb, var(--pz-title) 30%, transparent);
+  @apply border-primary-200 text-primary-700 dark:border-primary-800 dark:text-primary-200;
 }
 
-@media (max-width: 640px) {
-  .plaza-pricing-table table {
-    table-layout: fixed;
+.plaza-pricing-table {
+  container-type: inline-size;
+}
+
+.pz-compact-label {
+  display: none;
+}
+
+@container (width < 52rem) {
+  table,
+  tbody {
+    display: block;
+    min-width: 0;
   }
 
-  .plaza-pricing-table col {
-    width: auto;
+  thead {
+    @apply sr-only;
   }
 
-  .plaza-pricing-table col:first-child {
-    width: 120px;
+  colgroup {
+    display: none;
   }
 
-  .plaza-pricing-table thead tr:first-child > th:first-child,
-  .plaza-pricing-table tbody tr > td:first-child {
-    position: sticky;
-    left: 0;
-    z-index: 1;
-    box-sizing: border-box;
-    width: 120px;
-    min-width: 120px;
-    max-width: 120px;
-    padding-inline: 12px;
+  tbody tr {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    @apply border-b border-accent-200 dark:border-dark-700;
+  }
+
+  tbody td {
+    min-width: 0;
     overflow-wrap: anywhere;
-    background: var(--ui-surface);
+    @apply border-0 px-4 py-2;
   }
 
-  .plaza-pricing-table tbody tr > td:first-child span {
+  tbody td .whitespace-nowrap {
     white-space: normal;
+  }
+
+  .pz-model,
+  .pz-discounted-detail,
+  .pz-official-cache {
+    grid-column: 1 / -1;
+  }
+
+  .pz-model {
+    @apply py-3;
+  }
+
+  .pz-compact-label {
+    display: flex;
+    align-items: flex-end;
+    @apply mb-1 font-sans text-xs font-medium text-accent-600 dark:text-dark-300;
+  }
+
+  .pz-compact-label::before {
+    content: attr(data-label);
+    white-space: pre-line;
+  }
+
+  .pz-compact-core .pz-compact-label {
+    min-height: 3lh;
+  }
+
+  .pz-discounted-detail,
+  .pz-official-cache {
+    @apply pb-3;
   }
 }
 
 .pz-unit {
-  color: color-mix(in srgb, var(--pz-title) 62%, transparent);
+  @apply text-primary-700 dark:text-primary-200;
 }
 </style>

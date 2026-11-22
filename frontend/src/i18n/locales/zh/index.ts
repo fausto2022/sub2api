@@ -19,9 +19,10 @@ export default {
   ...dashboard,
   modelPlaza: {
     ...dashboard.modelPlaza,
-    description: '按类型和分组浏览模型与价格。',
-    empty: '暂无可用模型。',
-    noSearchResult: '没有符合筛选条件的模型。',
+    description: '按厂商和分组浏览模型与价格。',
+    empty: '暂无可浏览的分组。',
+    noSearchResult: '没有找到匹配的模型。',
+    clearSearch: '清除搜索',
     emptyGroups: '暂未配置模型的分组',
     clearFilters: '清除筛选',
     retry: '重试',
@@ -39,8 +40,13 @@ export default {
       typeLabel: '模型类型',
       allGroups: '全部分组'
     },
+    detail: {
+      ...dashboard.modelPlaza.detail,
+      noModels: '暂无模型'
+    },
     table: {
       ...dashboard.modelPlaza.table,
+      officialPrice: '官方价',
       peakPriceHint: '这里显示的模型峰时价已乘生效的分组倍率或专属倍率。',
       referenceMetric: '{priceSource}：{metric}',
       tokenPriceLabel: '{metric}（{unit}）',

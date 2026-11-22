@@ -148,31 +148,22 @@ describe('PlazaGroupSection 高峰配置传递', () => {
   })
 })
 
-/**
- * 目录价模型数（design.md §4.3 分组统计）：后端下发 catalog_model_count，
- * 旧后端缺失该字段时回退按组内模型自身 catalog_pricing 计数。
- */
-describe('PlazaGroupSection 目录价模型数', () => {
-  const BADGE = 'modelPlaza.table.catalogModelCount'
+describe('PlazaGroupSection pricing metadata', () => {
+  it('does not display a catalog badge even when the backend supplies a catalog model count and price', () => {
+    const model = ladderModel(1)
+    model.catalog_pricing = model.pricing
+    const wrapper = mountSection(group({ catalog_model_count: 3, models: [model] }))
 
-  it('后端下发 catalog_model_count 时展示徽章', () => {
-    const wrapper = mountSection(group({ catalog_model_count: 3 }))
-    expect(wrapper.text()).toContain(BADGE)
+    expect(wrapper.text()).not.toContain('modelPlaza.table.catalogModelCount')
+    expect(wrapper.findComponent(PlazaModelPricingTable).props('models')).toEqual([model])
   })
 
-  it('catalog_model_count 为 0 时不展示徽章', () => {
-    const wrapper = mountSection(group({ catalog_model_count: 0 }))
-    expect(wrapper.text()).not.toContain(BADGE)
-  })
+  it('does not infer a catalog badge from model prices when the count is absent', () => {
+    const model = ladderModel(1)
+    model.catalog_pricing = model.pricing
+    const wrapper = mountSection(group({ models: [model] }))
 
-  it('旧后端缺字段时按组内模型的 catalog_pricing 计数', () => {
-    const withCatalog = { ...ladderModel(1), catalog_pricing: ladderModel(1).pricing }
-    const wrapper = mountSection(group({ models: [withCatalog] }))
-    expect(wrapper.text()).toContain(BADGE)
-  })
-
-  it('旧后端缺字段且组内无目录价模型时不展示徽章', () => {
-    const wrapper = mountSection(group())
-    expect(wrapper.text()).not.toContain(BADGE)
+    expect(wrapper.text()).not.toContain('modelPlaza.table.catalogModelCount')
+    expect(wrapper.findComponent(PlazaModelPricingTable).props('models')).toEqual([model])
   })
 })

@@ -1,8 +1,9 @@
 <template>
   <section
-    class="min-w-0 rounded-xl border border-accent-200 bg-white dark:border-dark-700 dark:bg-dark-800"
+    class="min-w-0"
+    :class="visibleModels.length ? 'overflow-hidden rounded-xl border border-accent-200 bg-white dark:border-dark-700 dark:bg-dark-800' : 'flex flex-wrap items-center justify-between gap-x-3 border-b border-accent-200 last:border-b-0 dark:border-dark-700'"
   >
-    <header class="px-4 py-3 sm:px-5" :class="{ 'border-b border-accent-200 dark:border-dark-700': visibleModels.length }">
+    <header class="px-4 py-3 sm:px-5" :class="{ 'border-b border-accent-200 bg-accent-50 dark:border-dark-700 dark:bg-dark-800': visibleModels.length }">
       <div class="flex flex-wrap items-center gap-2">
         <h3 class="min-w-0 max-w-full">
           <GroupBadge
@@ -28,15 +29,6 @@
           class="inline-flex items-center rounded-md bg-violet-50 px-2 py-0.5 text-xs font-medium text-violet-600 dark:bg-violet-900/20 dark:text-violet-400"
         >
           {{ t('modelPlaza.badges.subscription') }}
-        </span>
-        <!-- 目录价模型数：本分组中价格来自「模型价格」页目录价的模型数量 -->
-        <span
-          v-if="catalogModelCount > 0"
-          class="inline-flex items-center gap-1 rounded-md bg-primary-50 px-2 py-0.5 text-xs font-medium text-primary-600 dark:bg-primary-900/20 dark:text-primary-300"
-          :title="t('modelPlaza.table.catalogModelCountHint', { count: catalogModelCount })"
-        >
-          <Icon name="cube" size="xs" class="h-3 w-3" />
-          {{ t('modelPlaza.table.catalogModelCount', { count: catalogModelCount }) }}
         </span>
       </div>
       <p v-if="group.description" class="mt-2 text-sm text-gray-500 dark:text-dark-400">
@@ -73,7 +65,7 @@
         :peak-window="peakWindow"
         :peak-rate-multiplier="group.peak_rate_multiplier"
       />
-      <p v-else class="px-5 py-4 text-center text-sm text-gray-400 dark:text-dark-500">
+      <p v-else class="px-4 pb-3 text-xs text-accent-600 dark:text-dark-300 sm:px-5 sm:py-3">
         {{ t('modelPlaza.detail.noModels') }}
       </p>
     </div>
@@ -100,15 +92,6 @@ const visibleModels = computed(() => props.models ?? props.group.models ?? [])
 
 const { t } = useI18n()
 const appStore = useAppStore()
-
-/**
- * 目录价模型数（分组统计，后端 `catalog_model_count`）。
- * 旧后端不下发该字段时回退按组内模型自身 catalog_pricing 计数。
- */
-const catalogModelCount = computed(() => {
-  if (props.models === undefined && typeof props.group.catalog_model_count === 'number') return props.group.catalog_model_count
-  return visibleModels.value.filter((m) => m.catalog_pricing != null).length
-})
 
 /** 高峰窗口描述(含倍率与服务器时区标注);分组未启用高峰为空串。 */
 const peakWindow = computed(() => {

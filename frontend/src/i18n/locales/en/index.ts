@@ -19,9 +19,10 @@ export default {
   ...dashboard,
   modelPlaza: {
     ...dashboard.modelPlaza,
-    description: 'Browse models and pricing by type and group.',
-    empty: 'No models are available yet.',
-    noSearchResult: 'No models match your filters.',
+    description: 'Browse models and pricing by provider and group.',
+    empty: 'No groups are available yet.',
+    noSearchResult: 'No models match your search.',
+    clearSearch: 'Clear search',
     emptyGroups: 'Groups without models',
     clearFilters: 'Clear filters',
     retry: 'Try again',
@@ -39,8 +40,13 @@ export default {
       typeLabel: 'Model type',
       allGroups: 'All groups'
     },
+    detail: {
+      ...dashboard.modelPlaza.detail,
+      noModels: 'No models yet'
+    },
     table: {
       ...dashboard.modelPlaza.table,
+      officialPrice: 'Official price',
       peakPriceHint: 'The per-model peak price shown includes the effective group or personal rate.',
       referenceMetric: '{priceSource}: {metric}',
       tokenPriceLabel: '{metric} ({unit})',

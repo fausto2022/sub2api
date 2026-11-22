@@ -1,69 +1,57 @@
-import { PLAZA_MODEL_TYPES, type ModelPlazaGroup, type PlazaModel, type PlazaModelType } from '@/api/modelPlaza'
+import type { ModelPlazaGroup } from '@/api/modelPlaza'
+import type { GroupPlatform } from '@/types'
+import { getKeyGroupProvider, KEY_GROUP_PROVIDERS, type KeyGroupProvider } from '@/utils/keyGroupProviders'
 
-export type PlazaTypeFilter = PlazaModelType | 'all'
 export type PlazaGroupFilter = number | 'all'
 
-interface CatalogGroup {
-  group: ModelPlazaGroup
-  models: PlazaModel[]
-}
-
-/** Index the authorized response before applying filters; type navigation stays stable while filtering. */
+/** Index only groups returned by the plaza API, including groups without models. */
 export function buildPlazaCatalog(groups: readonly ModelPlazaGroup[]) {
   const groupRate = (group: ModelPlazaGroup) => group.user_rate_multiplier ?? group.rate_multiplier
   const sortedGroups = [...groups].sort(
     (a, b) => groupRate(a) - groupRate(b) || a.name.localeCompare(b.name) || a.id - b.id
   )
-  const typeGroups = new Map<PlazaModelType, CatalogGroup[]>()
-  const emptyGroups: ModelPlazaGroup[] = []
-
+  const groupsByProvider = new Map<KeyGroupProvider, ModelPlazaGroup[]>()
   for (const group of sortedGroups) {
-    // Older responses can encode an empty model list as null.
-    const models = group.models ?? []
-    if (!models.length) {
-      emptyGroups.push(group)
-      continue
-    }
-    const modelsByType = new Map<PlazaModelType, PlazaModel[]>()
-    for (const model of models) {
-      const value = model.model_type
-      const type = value && PLAZA_MODEL_TYPES.includes(value) ? value : 'other'
-      const typedModels = modelsByType.get(type) ?? []
-      typedModels.push(model)
-      modelsByType.set(type, typedModels)
-    }
-    for (const [type, typedModels] of modelsByType) {
-      const entries = typeGroups.get(type) ?? []
-      entries.push({ group, models: typedModels })
-      typeGroups.set(type, entries)
-    }
+    const provider = getKeyGroupProvider(group.platform as GroupPlatform)
+    const entries = groupsByProvider.get(provider) ?? []
+    entries.push(group)
+    groupsByProvider.set(provider, entries)
   }
 
-  const types = PLAZA_MODEL_TYPES.filter(type => typeGroups.has(type))
-  return { groups: sortedGroups, emptyGroups, types, typeGroups }
+  return { groupsByProvider, providers: KEY_GROUP_PROVIDERS.filter(provider => groupsByProvider.has(provider)) }
+}
+
+type PlazaCatalog = ReturnType<typeof buildPlazaCatalog>
+
+export function resolvePlazaSelection(
+  catalog: PlazaCatalog,
+  provider: KeyGroupProvider | null,
+  groupId: PlazaGroupFilter
+): { provider: KeyGroupProvider | null; groupId: PlazaGroupFilter } {
+  const groups = provider ? catalog.groupsByProvider.get(provider) : undefined
+  if (!groups) return { provider: catalog.providers[0] ?? null, groupId: 'all' }
+  return { provider, groupId: groups.some(group => group.id === groupId) ? groupId : 'all' }
 }
 
 export function filterPlazaCatalog(
-  catalog: ReturnType<typeof buildPlazaCatalog>,
-  selectedType: PlazaTypeFilter,
-  selectedGroup: PlazaGroupFilter,
+  groups: readonly ModelPlazaGroup[],
+  groupId: PlazaGroupFilter,
   search: string
 ) {
   const query = search.trim().toLowerCase()
-  const matchesGroup = (group: ModelPlazaGroup) => selectedGroup === 'all' || group.id === selectedGroup
-  const sections = catalog.types.flatMap(type => {
-    if (selectedType !== 'all' && selectedType !== type) return []
-    const groups = (catalog.typeGroups.get(type) ?? []).flatMap(({ group, models }) => {
-      if (!matchesGroup(group)) return []
-      const matched = query ? models.filter(model => model.name.toLowerCase().includes(query)) : models
-      return matched.length ? [{ group, models: matched }] : []
-    })
-    return groups.length ? [{ type, groups }] : []
+  const selectedGroups = groupId === 'all' ? groups : groups.filter(group => group.id === groupId)
+  const emptyGroups = selectedGroups.filter(group => !group.models?.length)
+  const entries = selectedGroups.flatMap(group => {
+    const models = group.models ?? []
+    const matched = query ? models.filter(model => model.name.toLowerCase().includes(query)) : models
+    return matched.length ? [{ group, models: matched }] : []
   })
 
-  const emptyGroups = catalog.emptyGroups.filter(matchesGroup)
-  const noMatch = !sections.length && catalog.types.length > 0 &&
-    (selectedGroup === 'all' || emptyGroups.length === 0 || query !== '')
-
-  return { sections, emptyGroups, noMatch }
+  // When the scope itself is empty, keep the empty-group state even with a search term.
+  const hasModels = emptyGroups.length < selectedGroups.length
+  return {
+    entries,
+    emptyGroups: query && hasModels ? [] : emptyGroups,
+    noMatch: query !== '' && hasModels && !entries.length
+  }
 }
